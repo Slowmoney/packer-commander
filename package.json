@@ -1,0 +1,49 @@
+{
+    "name": "packer-commander",
+    "version": "0.1.0",
+    "description": "TUI-раннер npm-скриптов монорепозитория: живые статусы задач, логи, поиск и пайплайны GitLab",
+    "keywords": [
+        "tui",
+        "monorepo",
+        "workspaces",
+        "npm-scripts",
+        "task-runner",
+        "gitlab",
+        "blessed",
+        "cli"
+    ],
+    "license": "MIT",
+    "author": "Slowmoney",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/Slowmoney/packer-commander.git"
+    },
+    "bugs": {
+        "url": "https://github.com/Slowmoney/packer-commander/issues"
+    },
+    "homepage": "https://github.com/Slowmoney/packer-commander#readme",
+    "type": "commonjs",
+    "main": "src/task-runner.js",
+    "bin": {
+        "packer-commander": "bin/packer-commander.js",
+        "pc": "bin/packer-commander.js"
+    },
+    "files": [
+        "bin/",
+        "src/",
+        "README.md",
+        "LICENSE"
+    ],
+    "engines": {
+        "node": ">=20.0.0"
+    },
+    "scripts": {
+        "start": "node bin/packer-commander.js",
+        "test": "node --test test/task-runner.test.js test/cli.test.js",
+        "self-check": "node bin/packer-commander.js --self-check",
+        "prepublishOnly": "npm test"
+    },
+    "dependencies": {
+        "blessed": "^0.1.81"
+    }
+}
