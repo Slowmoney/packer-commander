@@ -15,6 +15,9 @@ const {
     SidePanelModel,
     NavigationStack,
     SearchState,
+    stripTags,
+    bufferToText,
+    copyToClipboard,
     assertTerminal,
     GitLabClient,
     PipelineStore,
@@ -722,6 +725,55 @@ test('createPipelineStore включается, когда есть remote и т
     assert.equal(store.isEnabled(), true);
     assert.equal(store.ref, 'feature/x');
     assert.equal(store.client.projectPath, 'g/sub/app');
+});
+
+test('stripTags возвращает чистый текст и восстанавливает скобки', () => {
+    assert.equal(stripTags('{red-fg}error{/} done'), 'error done');
+    assert.equal(stripTags('{open}ok{close}'), '{ok}');
+    assert.equal(stripTags('{yellow-bg}{black-fg}line{/}'), 'line');
+    assert.equal(stripTags('src/app.ts(4,1)'), 'src/app.ts(4,1)');
+});
+
+test('stripTags обратен AnsiTags.convert для типичного вывода сборки', () => {
+    const raw = '\x1b[31msrc/app.ts(4,1): error TS2345\x1b[0m';
+    assert.equal(stripTags(AnsiTags.convert(raw)), 'src/app.ts(4,1): error TS2345');
+});
+
+test('bufferToText отдаёт лог без разметки, с таймстемпами по требованию', () => {
+    const buffer = new LogBuffer({ now: () => new Date('2026-08-12T10:20:30Z') });
+    buffer.append('\x1b[31mboom\x1b[0m\nplain\n', 'stdout');
+
+    assert.equal(bufferToText(buffer), 'boom\nplain');
+    assert.equal(bufferToText(buffer, { withTimestamps: true }), '10:20:30 boom\n10:20:30 plain');
+    assert.equal(bufferToText(null), '');
+});
+
+test('copyToClipboard зовёт системную утилиту по платформе', () => {
+    const calls = [];
+    const where = copyToClipboard('текст', {
+        platform: 'win32',
+        spawnSyncImpl: (command, args, options) => {
+            calls.push({ command, args, input: options.input });
+            return { status: 0 };
+        },
+        stdout: { write: () => {} },
+    });
+
+    assert.equal(where, 'системный буфер');
+    assert.deepEqual(calls, [{ command: 'clip', args: [], input: 'текст' }]);
+});
+
+test('copyToClipboard падает на OSC 52, когда утилиты нет', () => {
+    const written = [];
+    const where = copyToClipboard('hi', {
+        platform: 'linux',
+        spawnSyncImpl: () => ({ error: new Error('ENOENT') }),
+        stdout: { write: (text) => written.push(text) },
+    });
+
+    assert.equal(where, 'терминал (OSC 52)');
+    assert.equal(written.length, 1);
+    assert.equal(written[0], `\x1b]52;c;${Buffer.from('hi').toString('base64')}\x07`);
 });
 
 test('SearchState.nextMatch циклически ходит по совпадениям', () => {

@@ -318,6 +318,68 @@ class AnsiTags {
 }
 
 /** Кольцевой буфер строк лога с раздельным таймстемпом и поиском. */
+/**
+ * Обратная операция к AnsiTags: теги blessed убираем, экранированные скобки
+ * возвращаем как есть. Нужно для копирования в буфер обмена — там нужен текст,
+ * а не разметка.
+ */
+function stripTags(text) {
+    return String(text ?? '')
+        .replace(/\{open\}/g, ' OPEN ')
+        .replace(/\{close\}/g, ' CLOSE ')
+        .replace(/\{[^{}]*\}/g, '')
+        .replace(/ OPEN /g, '{')
+        .replace(/ CLOSE /g, '}');
+}
+
+/** Текст буфера для копирования: без тегов, по желанию с таймстемпами. */
+function bufferToText(buffer, { withTimestamps = false } = {}) {
+    const lines = buffer?.lines() ?? [];
+    return lines
+        .map((line) => {
+            const stamp = withTimestamps ? `${line.ts.toISOString().slice(11, 19)} ` : '';
+            return `${stamp}${stripTags(line.text)}`;
+        })
+        .join('\n');
+}
+
+const CLIPBOARD_TOOLS = {
+    win32: { command: 'clip', args: [] },
+    darwin: { command: 'pbcopy', args: [] },
+    linux: { command: 'xclip', args: ['-selection', 'clipboard'] },
+};
+
+/**
+ * Копирование без мыши. Сначала системная утилита, потом OSC 52 — он проходит
+ * даже через ssh и понимается VS Code и Windows Terminal.
+ */
+function copyToClipboard(
+    text,
+    { platform = process.platform, spawnSyncImpl = spawnSync, stdout = process.stdout } = {}
+) {
+    const tool = CLIPBOARD_TOOLS[platform];
+    if (tool) {
+        try {
+            const result = spawnSyncImpl(tool.command, tool.args, {
+                input: text,
+                windowsHide: true,
+            });
+            if (result && !result.error && (result.status === 0 || result.status === null)) {
+                return 'системный буфер';
+            }
+        } catch {
+            // утилиты нет — уходим на OSC 52
+        }
+    }
+    try {
+        const payload = Buffer.from(text, 'utf8').toString('base64');
+        stdout.write(`\x1b]52;c;${payload}\x07`);
+        return 'терминал (OSC 52)';
+    } catch {
+        return null;
+    }
+}
+
 class LogBuffer {
     constructor({ limit = LOG_LIMIT, now = () => new Date() } = {}) {
         this.limit = limit;
@@ -1158,39 +1220,57 @@ class HomeView extends View {
 
     mount() {
         const blessed = this.app.blessed;
-        this.side = blessed.box({
-            parent: this.app.body,
-            left: 0,
-            top: 0,
-            width: SIDE_WIDTH,
-            height: '100%',
-            border: 'line',
-            label: ' Задачи ',
-            tags: true,
-            scrollable: true,
-            alwaysScroll: true,
-            // Отступ от рамок: без него текст прилипает к "│", и Ctrl+click в
-            // VS Code уносит рамку в путь файла вместе со ссылкой.
-            padding: { left: 1, right: 1 },
-        });
-        // Правая колонка одна и меняется по контексту левой: на команде — её сервисы,
-        // на задаче — её лог.
-        this.right = blessed.box({
-            parent: this.app.body,
-            left: SIDE_WIDTH,
-            top: 0,
-            right: 0,
-            height: '100%',
-            border: 'line',
-            label: ' Лог ',
-            tags: true,
-            scrollable: true,
-            alwaysScroll: true,
-            keys: false,
-            scrollbar: { ch: ' ', style: { bg: 'grey' } },
-            padding: { left: 1, right: 1 },
-        });
-        this.widgets = [this.side, this.right];
+        if (this.zoom) {
+            // Режим копирования: одна колонка на весь экран, без рамок и отступов.
+            // Мышью выделяется только текст лога — левое меню в выделение не попадает.
+            this.side = null;
+            this.right = blessed.box({
+                parent: this.app.body,
+                left: 0,
+                top: 0,
+                right: 0,
+                height: '100%',
+                tags: true,
+                scrollable: true,
+                alwaysScroll: true,
+                keys: false,
+            });
+            this.widgets = [this.right];
+        } else {
+            this.side = blessed.box({
+                parent: this.app.body,
+                left: 0,
+                top: 0,
+                width: SIDE_WIDTH,
+                height: '100%',
+                border: 'line',
+                label: ' Задачи ',
+                tags: true,
+                scrollable: true,
+                alwaysScroll: true,
+                // Отступ от рамок: без него текст прилипает к "│", и Ctrl+click в
+                // VS Code уносит рамку в путь файла вместе со ссылкой.
+                padding: { left: 1, right: 1 },
+            });
+            // Правая колонка одна и меняется по контексту левой: на команде — её
+            // сервисы, на задаче — её лог.
+            this.right = blessed.box({
+                parent: this.app.body,
+                left: SIDE_WIDTH,
+                top: 0,
+                right: 0,
+                height: '100%',
+                border: 'line',
+                label: ' Лог ',
+                tags: true,
+                scrollable: true,
+                alwaysScroll: true,
+                keys: false,
+                scrollbar: { ch: ' ', style: { bg: 'grey' } },
+                padding: { left: 1, right: 1 },
+            });
+            this.widgets = [this.side, this.right];
+        }
         this.model.rebuild();
         this.syncServices();
         this.app.manager.on('changed', this.onChanged);
@@ -1389,6 +1469,13 @@ class HomeView extends View {
         this.syncServices();
         const rows = this.model.rows();
         const cursor = this.model.cursorRowIndex();
+        if (this.side) {
+            this.renderSide(rows, cursor);
+        }
+        this.renderRight();
+    }
+
+    renderSide(rows, cursor) {
         this.side.setContent(
             rows
                 .map((row, position) => {
@@ -1402,7 +1489,9 @@ class HomeView extends View {
         // Список команд, задач и пайплайнов длиннее окна — держим курсор в виду,
         // иначе нижние элементы просто не показываются.
         this.side.scrollTo(cursor);
+    }
 
+    renderRight() {
         const context = this.rightContext();
         if (context === 'services') {
             this.renderServices();
@@ -1421,8 +1510,39 @@ class HomeView extends View {
             }
             this.pendingScroll = null;
         }
-        this.side.style.border = { fg: this.focus === 'side' ? 'cyan' : 'white' };
-        this.right.style.border = { fg: this.focus === 'right' ? 'cyan' : 'white' };
+        if (this.side) {
+            this.side.style.border = { fg: this.focus === 'side' ? 'cyan' : 'white' };
+            this.right.style.border = { fg: this.focus === 'right' ? 'cyan' : 'white' };
+        }
+    }
+
+    /** Лог на весь экран без рамок: чтобы выделение мышью не хватало левое меню. */
+    toggleZoom() {
+        this.captureState();
+        this.unmount();
+        this.zoom = !this.zoom;
+        if (this.zoom) {
+            this.focus = 'right';
+        }
+        this.mount();
+        this.app.render();
+    }
+
+    /** Копирование текущего содержимого в буфер обмена — мышь не нужна вовсе. */
+    copyActive() {
+        const buffer = this.activeBuffer();
+        if (!buffer) {
+            this.app.notify('Копировать нечего: выбери задачу или трассу.');
+            return;
+        }
+        const text = bufferToText(buffer, { withTimestamps: this.showTimestamps });
+        const where = this.app.clipboard(text);
+        const lines = buffer.lines().length;
+        this.app.notify(
+            where
+                ? `Скопировано строк: ${lines} → ${where}`
+                : 'Не удалось скопировать: нет ни утилиты, ни OSC 52.'
+        );
     }
 
     renderServices() {
@@ -1674,6 +1794,14 @@ class HomeView extends View {
             this.render();
             return true;
         }
+        if (name === 'z') {
+            this.toggleZoom();
+            return true;
+        }
+        if (name === 'y') {
+            this.copyActive();
+            return true;
+        }
         if (name === 'd') {
             const task = this.selectedTask();
             if (task) {
@@ -1849,9 +1977,9 @@ class HomeView extends View {
             return '↑↓ джоба  Enter трасса  ←/Esc назад  r обновить  q выход';
         }
         if (context === 'trace') {
-            return '↑↓ PgUp/PgDn скролл  / поиск  t время  ←/Esc назад  q выход';
+            return '↑↓ PgUp/PgDn скролл  / поиск  y копировать  z на весь экран  t время  ←/Esc назад';
         }
-        return 'Tab/←→ колонки  Enter выбрать  Пробел режим  p пайплайн  s стоп  S стоп все  d забыть  i детали  t время  / поиск  r обновить  ? помощь  q выход';
+        return 'Tab/←→ колонки  Enter выбрать  Пробел режим  y копировать  z весь экран  p пайплайн  s стоп  S стоп все  d забыть  i детали  t время  / поиск  r обновить  ? помощь  q выход';
     }
 }
 
@@ -1929,6 +2057,8 @@ class HelpView extends View {
                 'd            забыть завершённую задачу',
                 'i            детали задачи',
                 't            показать или скрыть таймстемпы',
+                'y            скопировать лог или трассу в буфер обмена',
+                'z            лог на весь экран без рамок — чтобы выделять мышью',
                 '/            поиск по логу, Escape — снять',
                 'PgUp / PgDn  история лога, Home / End — начало и конец',
                 'r            пересканировать воркспейсы',
@@ -1985,7 +2115,16 @@ class ConfirmView extends View {
 }
 
 class TuiApp {
-    constructor({ repoRoot, blessedImpl = null, tickMs = TICK_MS, pipelines = null, roots = null }) {
+    constructor({
+        repoRoot,
+        blessedImpl = null,
+        tickMs = TICK_MS,
+        pipelines = null,
+        roots = null,
+        clipboardImpl = null,
+    }) {
+        this.clipboard = clipboardImpl ?? ((text) => copyToClipboard(text));
+        this.notice = null;
         this.repoRoot = repoRoot;
         this.blessed = blessedImpl ?? require('blessed');
         this.tickMs = tickMs;
@@ -2075,7 +2214,15 @@ class TuiApp {
     renderStatus() {
         const { running, done, failed } = this.manager.counters();
         const left = `{green-fg}Запущено: ${running}{/}  Готово: ${done}  {red-fg}Ошибок: ${failed}{/}`;
-        this.statusBar.setContent(`${left} │ ${this.stack.top().hotkeys()}`);
+        const right = this.notice ? `{yellow-fg}${this.notice}{/}` : this.stack.top().hotkeys();
+        this.statusBar.setContent(`${left} │ ${right}`);
+    }
+
+    /** Разовое сообщение в статус-баре — до следующего нажатия клавиши. */
+    notify(text) {
+        this.notice = text;
+        this.renderStatus();
+        this.screen.render();
     }
 
     suspend(action) {
@@ -2110,6 +2257,9 @@ class TuiApp {
 
     onKey(chunk, key) {
         const name = key?.name;
+        // Сообщение живёт до следующей клавиши: гасим прежнее перед обработкой,
+        // чтобы новое, выставленное этим же нажатием, осталось видно.
+        this.notice = null;
         // blessed на "\r" пере-эмитит тот же keypress под именем "enter"
         // (program.js:397-399), причём из-за вложенности синтетическое событие
         // доходит сюда РАНЬШЕ настоящего "return". Без этой отбивки один Enter
@@ -2119,7 +2269,9 @@ class TuiApp {
             return;
         }
         if (this.stack.top().handleKey(chunk, key)) {
-            this.screen.render();
+            // Не только screen.render(): статус-бар держит подсказки контекста,
+            // счётчики и разовые сообщения — их тоже надо обновить.
+            this.render();
             return;
         }
         if (name === 'backspace') {
@@ -2203,6 +2355,9 @@ module.exports = {
     SidePanelModel,
     NavigationStack,
     SearchState,
+    stripTags,
+    bufferToText,
+    copyToClipboard,
     GitLabClient,
     PipelineStore,
     parseGitLabRemote,

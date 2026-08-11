@@ -15,13 +15,13 @@ const {
     PipelineStore,
 } = require('../src/task-runner.js');
 
-function widget() {
+function widget(options = {}) {
     return {
+        options,
         content: '',
         label: '',
         height: 10,
         style: {},
-        options: {},
         scrolledTo: null,
         setContent(text) {
             this.content = text;
@@ -100,7 +100,7 @@ function gitlabStub(calls) {
     };
 }
 
-function bootstrap() {
+function bootstrap(extra = {}) {
     const screen = new EventEmitter();
     screen.render = () => {};
     screen.destroy = () => {};
@@ -117,9 +117,10 @@ function bootstrap() {
     const repoRoot = makeRepo();
     const app = new TuiApp({
         repoRoot,
-        blessedImpl: { screen: () => screen, box: () => widget() },
+        blessedImpl: { screen: () => screen, box: (options) => widget(options) },
         tickMs: 100_000,
         pipelines,
+        ...extra,
     });
     const children = [];
     app.manager = new TaskManager({
@@ -382,6 +383,76 @@ test('поиск по логу подсвечивает совпадения', (
         assert.match(home.right.content, /yellow-bg/);
         press(null, 'escape');
         assert.equal(home.search.active, false);
+    } finally {
+        cleanup();
+    }
+});
+
+test('z разворачивает лог на весь экран без рамок и меню', () => {
+    const { app, home, pressEnter, press, children, cleanup } = bootstrap();
+    try {
+        pressEnter();
+        pressEnter();
+        const task = app.manager.tasks()[0];
+        children[0].stdout.emit('data', 'alpha\nbeta\n');
+        press(null, 'left');
+        home.model.selectKey(`task:${task.id}`);
+        home.render();
+        assert.equal(home.widgets.length, 2, 'обычно две колонки');
+
+        press('z', 'z');
+        assert.equal(home.zoom, true);
+        assert.equal(home.widgets.length, 1, 'в зуме одна колонка');
+        assert.equal(home.side, null, 'левого меню нет — выделять мышью нечего лишнего');
+        assert.equal(home.right.options.border, undefined, 'без рамки');
+        assert.match(home.right.content, /alpha/, 'лог на месте');
+
+        press('z', 'z');
+        assert.equal(home.zoom, false);
+        assert.equal(home.widgets.length, 2, 'колонки вернулись');
+        assert.match(home.side.content, /Команды/);
+    } finally {
+        cleanup();
+    }
+});
+
+test('y копирует лог без разметки и сообщает об этом', () => {
+    const copied = [];
+    const { app, home, pressEnter, press, children, cleanup } = bootstrap({
+        clipboardImpl: (text) => {
+            copied.push(text);
+            return 'системный буфер';
+        },
+    });
+    try {
+        pressEnter();
+        pressEnter();
+        const task = app.manager.tasks()[0];
+        children[0].stdout.emit('data', 'plain line\n\x1b[31mred error\x1b[0m\n');
+        press(null, 'left');
+        home.model.selectKey(`task:${task.id}`);
+        home.render();
+
+        press('y', 'y');
+
+        assert.equal(copied.length, 1);
+        assert.equal(copied[0], 'plain line\nred error', 'ни тегов blessed, ни ANSI');
+        assert.match(app.statusBar.content, /Скопировано строк: 2/);
+        assert.match(app.statusBar.content, /системный буфер/);
+
+        // Сообщение живёт до следующей клавиши.
+        press(null, 'down');
+        assert.doesNotMatch(app.statusBar.content, /Скопировано/);
+    } finally {
+        cleanup();
+    }
+});
+
+test('y на команде честно говорит, что копировать нечего', () => {
+    const { app, press, cleanup } = bootstrap({ clipboardImpl: () => 'буфер' });
+    try {
+        press('y', 'y');
+        assert.match(app.statusBar.content, /Копировать нечего/);
     } finally {
         cleanup();
     }
