@@ -1156,6 +1156,10 @@ class HomeView extends View {
             label: ' Задачи ',
             tags: true,
             scrollable: true,
+            alwaysScroll: true,
+            // Отступ от рамок: без него текст прилипает к "│", и Ctrl+click в
+            // VS Code уносит рамку в путь файла вместе со ссылкой.
+            padding: { left: 1, right: 1 },
         });
         // Правая колонка одна и меняется по контексту левой: на команде — её сервисы,
         // на задаче — её лог.
@@ -1172,6 +1176,7 @@ class HomeView extends View {
             alwaysScroll: true,
             keys: false,
             scrollbar: { ch: ' ', style: { bg: 'grey' } },
+            padding: { left: 1, right: 1 },
         });
         this.widgets = [this.side, this.right];
         this.model.rebuild();
@@ -1279,6 +1284,9 @@ class HomeView extends View {
                 })
                 .join('\n')
         );
+        // Список команд, задач и пайплайнов длиннее окна — держим курсор в виду,
+        // иначе нижние элементы просто не показываются.
+        this.side.scrollTo(cursor);
 
         // Левая колонка тоже длинная: команды плюс все задачи.
         this.side.scrollTo(cursor);
@@ -1526,7 +1534,7 @@ class HomeView extends View {
                 this.applySearch();
                 return true;
             }
-            if (typeof chunk === 'string' && chunk.length === 1 && chunk >= ' ') {
+            if (!key?.ctrl && !key?.meta && typeof chunk === 'string' && chunk.length === 1 && chunk >= ' ') {
                 this.search.pattern += chunk;
                 this.applySearch();
                 return true;
@@ -1701,7 +1709,7 @@ class HomeView extends View {
             this.render();
             return true;
         }
-        if (typeof chunk === 'string' && chunk.length === 1 && chunk >= ' ') {
+        if (!key?.ctrl && !key?.meta && typeof chunk === 'string' && chunk.length === 1 && chunk >= ' ') {
             this.services.filter += chunk;
             this.services.cursor = 0;
             this.render();

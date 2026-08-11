@@ -39,7 +39,7 @@
     },
     "scripts": {
         "start": "node bin/packer-commander.js",
-        "test": "node --test test/task-runner.test.js test/cli.test.js",
+        "test": "node --test test/task-runner.test.js test/cli.test.js test/ui-smoke.test.js",
         "self-check": "node bin/packer-commander.js --self-check",
         "prepublishOnly": "npm test"
     },
