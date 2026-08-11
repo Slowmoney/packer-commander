@@ -94,6 +94,27 @@ root=/repo roots=apps,libs packages=43 commands=4
 
 Node.js 20 и новее. Нужен интерактивный терминал не меньше 80×24 — под пайпом или в CI раннер честно откажется работать с кодом 1.
 
+## Публикация
+
+Публикует GitHub Actions по тегу — вручную `npm publish` запускать не нужно:
+
+```bash
+npm version patch -m "chore: версия %s"
+git push --follow-tags
+```
+
+Workflow `.github/workflows/publish.yml` прогоняет тесты, сверяет тег с версией в
+`package.json` и публикует через **trusted publishing** (OIDC): токен в секретах не
+хранится, пакет получает provenance-подпись.
+
+Однократная настройка на стороне npm: в настройках пакета на npmjs.com →
+*Trusted publishers* → добавить GitHub Actions с владельцем `Slowmoney`,
+репозиторием `packer-commander` и файлом workflow `publish.yml`.
+
+Если trusted publishing по каким-то причинам не подходит, альтернатива — granular
+automation token в секрете `NPM_TOKEN` и `NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}`
+на шаге `npm publish`; тогда `id-token: write` и `npm install -g npm@latest` не нужны.
+
 ## Разработка
 
 ```bash

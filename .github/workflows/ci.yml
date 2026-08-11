@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Нижняя граница из engines и текущая LTS.
+        node: [20, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm test
+
+      # Проверяем не только тесты, но и то, что бинарь реально работает
+      # из собранного пакета: npm pack, установка в чистую папку, запуск.
+      - name: Проверить npx на собранном тарболе
+        run: |
+          set -eu
+          tarball="$(npm pack --silent)"
+          workdir="$(mktemp -d)"
+          cd "$workdir"
+          npm init -y >/dev/null
+          npm install --silent "$GITHUB_WORKSPACE/$tarball"
+          npx packer-commander --version
+          npx packer-commander --self-check

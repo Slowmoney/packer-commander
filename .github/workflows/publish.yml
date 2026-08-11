@@ -1,0 +1,46 @@
+name: Publish
+
+# Публикация по тегу: `npm version patch` создаёт тег v*, пуш тега публикует.
+#   npm version patch -m "chore: версия %s"
+#   git push --follow-tags
+on:
+  push:
+    tags: ['v*']
+  # Ручной запуск на случай, если тег уже стоит, а публикация упала.
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      # OIDC-токен для trusted publishing: секрет NPM_TOKEN не нужен.
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      # Trusted publishing требует свежий npm; тот, что идёт с Node, бывает старее.
+      - run: npm install -g npm@latest
+
+      - run: npm ci
+
+      - run: npm test
+
+      # Тег и package.json должны совпадать, иначе публикуется не то, что помечено.
+      - name: Сверить версию с тегом
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "Тег $tag не совпадает с версией в package.json ($pkg)" >&2
+            exit 1
+          fi
+
+      - run: npm publish
