@@ -221,15 +221,31 @@ class NpmCommand {
         return args;
     }
 
+    /**
+     * Чем запускать npm. Порядок важен именно на Windows: Node с 20.12 отказывается
+     * спавнить .cmd без shell (EINVAL), поэтому сначала ищем js-точку входа npm и
+     * запускаем её тем же node, и только в последнюю очередь зовём npm.cmd — уже
+     * через shell.
+     */
     spawnTarget() {
         const args = this.args();
         if (this.npmExecPath && this.exists(this.npmExecPath)) {
-            return { command: this.nodePath, args: [this.npmExecPath, ...args] };
+            return { command: this.nodePath, args: [this.npmExecPath, ...args], shell: false };
+        }
+        const bundled = path.join(
+            path.dirname(this.nodePath),
+            'node_modules',
+            'npm',
+            'bin',
+            'npm-cli.js'
+        );
+        if (this.exists(bundled)) {
+            return { command: this.nodePath, args: [bundled, ...args], shell: false };
         }
         if (this.platform === 'win32') {
-            return { command: 'npm.cmd', args };
+            return { command: 'npm.cmd', args, shell: true };
         }
-        return { command: 'npm', args };
+        return { command: 'npm', args, shell: false };
     }
 
     label() {
@@ -324,13 +340,19 @@ class AnsiTags {
  * а не разметка.
  */
 function stripTags(text) {
-    return String(text ?? '')
-        .replace(/\{open\}/g, ' OPEN ')
-        .replace(/\{close\}/g, ' CLOSE ')
-        .replace(/\{[^{}]*\}/g, '')
-        .replace(/ OPEN /g, '{')
-        .replace(/ CLOSE /g, '}');
+    // Один проход: разделители-заглушки не нужны, а значит и управляющих байтов
+    // в исходнике не будет.
+    return String(text ?? '').replace(/{open}|{close}|{[^{}]*}/g, (match) => {
+        if (match === '{open}') {
+            return '{';
+        }
+        if (match === '{close}') {
+            return '}';
+        }
+        return '';
+    });
 }
+
 
 /** Текст буфера для копирования: без тегов, по желанию с таймстемпами. */
 function bufferToText(buffer, { withTimestamps = false } = {}) {
@@ -684,8 +706,14 @@ class Task extends EventEmitter {
         setTimeoutImpl = setTimeout,
         clearTimeoutImpl = clearTimeout,
         logLimit = LOG_LIMIT,
+        platform = process.platform,
+        spawnSyncImpl = spawnSync,
+        killImpl = (pid, signal) => process.kill(pid, signal),
     }) {
         super();
+        this.platform = platform;
+        this.spawnSyncImpl = spawnSyncImpl;
+        this.killImpl = killImpl;
         this.id = id;
         this.npmCommand = npmCommand;
         this.now = now;
@@ -736,24 +764,51 @@ class Task extends EventEmitter {
         });
     }
 
+    /**
+     * Мы спавним npm, а он — node/nest/vite, который и держит порт. Поэтому убивать
+     * надо всё дерево: одиночный kill по pid снимает npm, а внук продолжает слушать
+     * порт, и следующий запуск падает с EADDRINUSE.
+     */
     stop() {
         if (!this.isRunning()) {
             return;
         }
-        try {
-            this.child?.kill('SIGTERM');
-        } catch (error) {
-            this.#write(`stop failed: ${error.message}\n`, 'stderr');
-        }
+        this.#terminate(false);
         this.#write('stop requested by user\n', 'stdout');
-        this.killTimer = this.setTimeoutImpl(() => {
+        this.killTimer = this.setTimeoutImpl(() => this.#terminate(true), this.killTimeoutMs);
+        this.#transition('stopped');
+    }
+
+    #terminate(force) {
+        if (!this.pid) {
+            return;
+        }
+        if (this.platform === 'win32') {
+            // На Windows сигналов нет: taskkill /T снимает дерево процессов,
+            // /F добавляет принудительность на втором заходе.
+            const args = ['/PID', String(this.pid), '/T'];
+            if (force) {
+                args.push('/F');
+            }
             try {
-                this.child?.kill('SIGKILL');
+                this.spawnSyncImpl('taskkill', args, { windowsHide: true });
+            } catch (error) {
+                this.#write(`taskkill failed: ${error.message}\n`, 'stderr');
+            }
+            return;
+        }
+        // На POSIX процесс запущен лидером своей группы (detached), поэтому
+        // отрицательный pid бьёт по всей группе — npm вместе с детьми.
+        const signal = force ? 'SIGKILL' : 'SIGTERM';
+        try {
+            this.killImpl(-this.pid, signal);
+        } catch {
+            try {
+                this.killImpl(this.pid, signal);
             } catch {
                 // процесс уже умер — добивать нечего
             }
-        }, this.killTimeoutMs);
-        this.#transition('stopped');
+        }
     }
 
     runtime(nowMs = this.now()) {
@@ -796,13 +851,17 @@ class TaskManager extends EventEmitter {
         spawnSyncImpl = spawnSync,
         idFactory = () => randomUUID().slice(0, 8),
         taskOptions = {},
+        platform = process.platform,
     }) {
         super();
         this.repoRoot = repoRoot;
         this.spawnImpl = spawnImpl;
         this.spawnSyncImpl = spawnSyncImpl;
         this.idFactory = idFactory;
-        this.taskOptions = taskOptions;
+        this.platform = platform;
+        // Платформу и spawnSync задача получает от менеджера: ей они нужны, чтобы
+        // снимать дерево процессов.
+        this.taskOptions = { platform, spawnSyncImpl, ...taskOptions };
         /** @type {Task[]} */
         this.items = [];
     }
@@ -813,9 +872,12 @@ class TaskManager extends EventEmitter {
         const target = npmCommand.spawnTarget();
         const child = this.spawnImpl(target.command, target.args, {
             cwd: this.repoRoot,
-            detached: false,
+            // На POSIX процесс становится лидером своей группы — только так стоп
+            // сможет прибить и npm, и его детей (node/nest/vite держат порт).
+            // На Windows группы нет, там дерево снимает taskkill /T.
+            detached: this.platform !== 'win32',
             stdio: ['ignore', 'pipe', 'pipe'],
-            shell: false,
+            shell: target.shell === true,
             windowsHide: true,
         });
         task.attach(child);
@@ -831,7 +893,7 @@ class TaskManager extends EventEmitter {
         const result = this.spawnSyncImpl(target.command, target.args, {
             cwd: this.repoRoot,
             stdio: 'inherit',
-            shell: false,
+            shell: target.shell === true,
             windowsHide: true,
         });
         return result.status ?? 1;

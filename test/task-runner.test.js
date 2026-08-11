@@ -60,7 +60,7 @@ function makeTask({ child = null, ...options } = {}) {
     return { task, child: attached };
 }
 
-function makeManager(children = []) {
+function makeManager(children = [], extra = {}) {
     const queue = [...children];
     const spawned = [];
     let counter = 0;
@@ -75,6 +75,7 @@ function makeManager(children = []) {
             counter += 1;
             return `id${counter}`;
         },
+        ...extra,
     });
     return { manager, spawned };
 }
@@ -152,35 +153,62 @@ test('NpmCommand собирает аргументы npm для обоих ре�
     assert.deepEqual(watch.args(), ['run', 'serve', '--workspace', 'apps/api', '--', '--watch']);
 });
 
-test('NpmCommand выбирает исполняемый файл: execpath, npm.cmd, npm', () => {
-    const base = { command: 'build', workspace: 'apps/api' };
-
-    const viaExecpath = new NpmCommand({
-        ...base,
+test('NpmCommand предпочитает npm_execpath и запускает его нашим node', () => {
+    const target = new NpmCommand({
+        command: 'build',
+        workspace: 'apps/api',
         nodePath: '/usr/bin/node',
         npmExecPath: '/npm/npm-cli.js',
         exists: () => true,
-    });
-    assert.deepEqual(viaExecpath.spawnTarget(), {
+    }).spawnTarget();
+
+    assert.deepEqual(target, {
         command: '/usr/bin/node',
         args: ['/npm/npm-cli.js', 'run', 'build', '--workspace', 'apps/api'],
+        shell: false,
     });
+});
 
+test('NpmCommand находит npm, поставляемый с Node, когда npm_execpath пуст', () => {
+    const nodePath = path.join('C:', 'Program Files', 'nodejs', 'node.exe');
+    const bundled = path.join(path.dirname(nodePath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+    const target = new NpmCommand({
+        command: 'serve',
+        workspace: 'apps/api',
+        platform: 'win32',
+        nodePath,
+        npmExecPath: '',
+        exists: (candidate) => candidate === bundled,
+    }).spawnTarget();
+
+    // Так обходится запрет Node на спавн .cmd без shell (EINVAL с 20.12).
+    assert.deepEqual(target, {
+        command: nodePath,
+        args: [bundled, 'run', 'serve', '--workspace', 'apps/api'],
+        shell: false,
+    });
+});
+
+test('NpmCommand в последнюю очередь зовёт npm.cmd и только через shell', () => {
     const onWindows = new NpmCommand({
-        ...base,
+        command: 'build',
+        workspace: 'apps/api',
         platform: 'win32',
         npmExecPath: '',
         exists: () => false,
-    });
-    assert.equal(onWindows.spawnTarget().command, 'npm.cmd');
+    }).spawnTarget();
+    assert.equal(onWindows.command, 'npm.cmd');
+    assert.equal(onWindows.shell, true, 'без shell Node вернёт EINVAL');
 
     const onLinux = new NpmCommand({
-        ...base,
+        command: 'build',
+        workspace: 'apps/api',
         platform: 'linux',
         npmExecPath: '/npm/gone.js',
         exists: () => false,
-    });
-    assert.equal(onLinux.spawnTarget().command, 'npm');
+    }).spawnTarget();
+    assert.equal(onLinux.command, 'npm');
+    assert.equal(onLinux.shell, false);
 });
 
 test('NpmCommand отдаёт подпись для заголовков', () => {
@@ -282,9 +310,13 @@ test('Task переходит в failed при ненулевом коде и п
 });
 
 test('Task после stop остаётся stopped, close его не перебивает', () => {
-    const { task, child } = makeTask();
+    const killed = [];
+    const { task, child } = makeTask({
+        platform: 'linux',
+        killImpl: (pid, signal) => killed.push({ pid, signal }),
+    });
     task.stop();
-    assert.deepEqual(child.killed, ['SIGTERM']);
+    assert.deepEqual(killed, [{ pid: -4242, signal: 'SIGTERM' }]);
     assert.equal(task.status, 'stopped');
 
     child.emit('close', 1, 'SIGTERM');
@@ -292,9 +324,12 @@ test('Task после stop остаётся stopped, close его не пере�
     assert.equal(task.exitCode, 1);
 });
 
-test('Task добивает процесс SIGKILL по таймауту', () => {
+test('Task на POSIX бьёт по группе процессов, а не только по npm', () => {
+    const killed = [];
     const scheduled = [];
-    const { task, child } = makeTask({
+    const { task } = makeTask({
+        platform: 'linux',
+        killImpl: (pid, signal) => killed.push({ pid, signal }),
         setTimeoutImpl: (fn, ms) => {
             scheduled.push({ fn, ms });
             return scheduled.length;
@@ -303,9 +338,79 @@ test('Task добивает процесс SIGKILL по таймауту', () =>
     });
 
     task.stop();
-    assert.equal(scheduled[0].ms, 5000);
+    // Отрицательный pid — вся группа: npm вместе с node/nest, который держит порт.
+    assert.deepEqual(killed, [{ pid: -4242, signal: 'SIGTERM' }]);
+
     scheduled[0].fn();
-    assert.deepEqual(child.killed, ['SIGTERM', 'SIGKILL']);
+    assert.deepEqual(killed[1], { pid: -4242, signal: 'SIGKILL' });
+});
+
+test('Task на POSIX откатывается на одиночный pid, если группы нет', () => {
+    const killed = [];
+    const { task } = makeTask({
+        platform: 'linux',
+        killImpl: (pid, signal) => {
+            if (pid < 0) {
+                throw new Error('ESRCH');
+            }
+            killed.push({ pid, signal });
+        },
+    });
+
+    task.stop();
+
+    assert.deepEqual(killed, [{ pid: 4242, signal: 'SIGTERM' }]);
+});
+
+test('Task на Windows снимает дерево через taskkill /T', () => {
+    const calls = [];
+    const scheduled = [];
+    const { task } = makeTask({
+        platform: 'win32',
+        spawnSyncImpl: (command, args) => {
+            calls.push({ command, args });
+            return { status: 0 };
+        },
+        setTimeoutImpl: (fn) => {
+            scheduled.push(fn);
+            return scheduled.length;
+        },
+        clearTimeoutImpl: () => {},
+    });
+
+    task.stop();
+    assert.deepEqual(calls, [{ command: 'taskkill', args: ['/PID', '4242', '/T'] }]);
+
+    scheduled[0]();
+    assert.deepEqual(calls[1], { command: 'taskkill', args: ['/PID', '4242', '/T', '/F'] });
+});
+
+test('TaskManager делает процесс лидером группы на POSIX и не делает на Windows', () => {
+    const { manager: posix, spawned: posixSpawned } = makeManager([], { platform: 'linux' });
+    posix.start({ command: 'serve', workspace: 'apps/api' });
+    assert.equal(posixSpawned[0].options.detached, true);
+
+    const { manager: windows, spawned: windowsSpawned } = makeManager([], { platform: 'win32' });
+    windows.start({ command: 'serve', workspace: 'apps/api' });
+    assert.equal(windowsSpawned[0].options.detached, false);
+});
+
+test('Task планирует добивание через 5 секунд', () => {
+    const scheduled = [];
+    const { task } = makeTask({
+        platform: 'linux',
+        killImpl: () => {},
+        setTimeoutImpl: (fn, ms) => {
+            scheduled.push({ fn, ms });
+            return scheduled.length;
+        },
+        clearTimeoutImpl: () => {},
+    });
+
+    task.stop();
+
+    assert.equal(scheduled.length, 1);
+    assert.equal(scheduled[0].ms, 5000);
 });
 
 test('Task не выходит из терминального статуса и не шлёт лишних событий', () => {
@@ -411,17 +516,24 @@ test('TaskManager эмитит changed при смене статуса зада
 });
 
 test('TaskManager stopAll останавливает только живые', () => {
+    const killed = [];
     const childA = fakeChild(1);
     const childB = fakeChild(2);
-    const { manager } = makeManager([childA, childB]);
+    const { manager } = makeManager([childA, childB], {
+        platform: 'linux',
+        taskOptions: {
+            platform: 'linux',
+            killImpl: (pid, signal) => killed.push({ pid, signal }),
+        },
+    });
     manager.start({ command: 'build', workspace: 'apps/a' });
     manager.start({ command: 'build', workspace: 'apps/b' });
     childA.emit('close', 0, null);
 
     manager.stopAll();
 
-    assert.deepEqual(childA.killed, []);
-    assert.deepEqual(childB.killed, ['SIGTERM']);
+    // Живой остался только второй — бьём по его группе и никого больше.
+    assert.deepEqual(killed, [{ pid: -2, signal: 'SIGTERM' }]);
 });
 
 test('TaskManager forget убирает завершённую и отказывает живой', () => {
