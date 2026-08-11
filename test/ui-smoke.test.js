@@ -32,10 +32,15 @@ function widget() {
         detach() {
             this.detached = true;
         },
-        scroll() {},
+        scroll(delta) {
+            this.scrolledTo = Math.max(0, (this.scrolledTo ?? 0) + delta);
+        },
         setScrollPerc() {},
         scrollTo(line) {
             this.scrolledTo = line;
+        },
+        getScroll() {
+            return this.scrolledTo ?? 0;
         },
     };
 }
@@ -241,6 +246,120 @@ test('переход с лога на команду показывает сер
         assert.equal(home.rightContext(), 'services');
         assert.match(home.right.label, /serve • режим/);
         assert.match(home.right.content, /apps\/api/, 'список не пустой сразу');
+    } finally {
+        cleanup();
+    }
+});
+
+test('каждая команда помнит свой фильтр и режим запуска', () => {
+    const { home, press, pressEnter, type, cleanup } = bootstrap();
+    try {
+        // build: фильтр "pay" и режим Watch.
+        pressEnter();
+        type('pay');
+        press(' ', 'space');
+        assert.equal(home.services.filter, 'pay');
+        assert.match(home.right.label, /build • режим: Watch/);
+
+        // Уходим на serve — там своё чистое состояние, но режим наследуется.
+        press(null, 'left');
+        home.model.selectKey('command:serve');
+        home.render();
+        assert.equal(home.services.filter, '', 'у новой команды свой фильтр');
+        assert.match(home.right.label, /serve • режим: Watch/, 'режим наследуется новым пунктом');
+        home.press = press;
+        press(null, 'right');
+        type('api');
+        press(' ', 'space');
+        assert.equal(home.services.filter, 'api');
+        assert.match(home.right.label, /serve • режим: В терминале/);
+
+        // Возврат на build: всё как оставили.
+        press(null, 'left');
+        home.model.selectKey('command:build');
+        home.render();
+        assert.equal(home.services.filter, 'pay', 'фильтр build восстановлен');
+        assert.match(home.right.label, /build • режим: Watch/, 'режим build восстановлен');
+
+        // И обратно на serve.
+        home.model.selectKey('command:serve');
+        home.render();
+        assert.equal(home.services.filter, 'api', 'фильтр serve восстановлен');
+        assert.match(home.right.label, /serve • режим: В терминале/);
+    } finally {
+        cleanup();
+    }
+});
+
+test('задача помнит свой поиск, автоскролл и позицию прокрутки', () => {
+    const { app, home, press, pressEnter, type, children, cleanup } = bootstrap();
+    try {
+        pressEnter();
+        pressEnter();
+        pressEnter();
+        press(null, 'left');
+        const [first, second] = app.manager.tasks();
+        children[0].stdout.emit('data', 'alpha\nerror one\nbeta\n');
+        children[1].stdout.emit('data', 'gamma\nerror two\ndelta\n');
+
+        // На первой задаче: поиск и уход от конца лога.
+        home.model.selectKey(`task:${first.id}`);
+        home.render();
+        press('/', 'slash');
+        type('error');
+        assert.equal(home.search.active, true);
+        assert.deepEqual(home.search.matches, [1]);
+        press(null, 'pageup');
+        assert.equal(home.autoScroll, false, 'ушли от конца лога');
+        const scrollOnFirst = home.right.getScroll();
+
+        // Вторая задача — своё состояние: поиска нет, автоскролл включён.
+        home.model.selectKey(`task:${second.id}`);
+        home.render();
+        assert.equal(home.search.active, false, 'у второй задачи свой поиск');
+        assert.equal(home.autoScroll, true, 'и свой автоскролл');
+
+        // Возврат к первой: поиск и прокрутка на месте.
+        home.model.selectKey(`task:${first.id}`);
+        home.render();
+        assert.equal(home.search.active, true, 'поиск восстановлен');
+        assert.equal(home.search.pattern, 'error');
+        assert.equal(home.autoScroll, false, 'автоскролл остался выключенным');
+        assert.equal(home.right.getScroll(), scrollOnFirst, 'позиция прокрутки восстановлена');
+    } finally {
+        cleanup();
+    }
+});
+
+test('пайплайн помнит курсор джобы и открытую трассу', async () => {
+    const { home, press, pressEnter, pipelines, cleanup } = bootstrap();
+    try {
+        await pipelines.refresh();
+        home.model.rebuild();
+        home.model.selectKey('pipeline:5');
+        home.render();
+
+        pressEnter();
+        await new Promise(setImmediate);
+        press(null, 'down');
+        assert.equal(home.jobCursor(), 1, 'курсор на второй джобе');
+        assert.equal(home.jobs.selectedJobId, 51, 'выбор хранится id, а не индексом');
+        pressEnter();
+        await new Promise(setImmediate);
+        await new Promise(setImmediate);
+        assert.equal(home.rightContext(), 'trace');
+
+        // Уходим на другой пайплайн курсором слева, не закрывая трассу через ←.
+        home.model.selectKey('pipeline:4');
+        home.render();
+        assert.equal(home.rightContext(), 'jobs', 'у другого пайплайна трасса не открыта');
+        assert.equal(home.jobCursor(), 0, 'и свой курсор джоб');
+
+        home.model.selectKey('pipeline:5');
+        home.render();
+        assert.equal(home.rightContext(), 'trace', 'трасса вернулась');
+        assert.equal(home.jobCursor(), 1, 'курсор джобы восстановлен');
+        assert.match(home.right.label, /test-api/, 'та же джоба');
     } finally {
         cleanup();
     }

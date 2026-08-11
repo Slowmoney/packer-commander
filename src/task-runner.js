@@ -1140,15 +1140,15 @@ class HomeView extends View {
             pipelines: app.pipelines,
         });
         this.focus = 'side';
+        // Показ таймстемпов — глобальная настройка отображения, а не свойство пункта.
         this.showTimestamps = false;
-        this.autoScroll = true;
-        this.search = { active: false, pattern: '', matches: [], position: 0 };
-        // Вторая колонка: сервисы выбранной команды. Модалок нет — Enter по команде
-        // просто переводит фокус вправо.
-        this.services = { command: null, items: [], cursor: 0, filter: '' };
-        this.jobs = { pipelineId: null, cursor: 0 };
-        this.trace = { job: null, buffer: null };
-        this.modeIndex = 0;
+        // Состояние правой колонки помнится для каждого пункта левой отдельно:
+        // фильтр и курсор сервисов, режим запуска, поиск, прокрутка, открытая трасса.
+        /** @type {Map<string, object>} */
+        this.states = new Map();
+        this.activeKey = null;
+        this.pendingScroll = null;
+        Object.assign(this, this.freshState(0));
         this.onChanged = () => {
             this.model.rebuild();
             this.render();
@@ -1197,6 +1197,74 @@ class HomeView extends View {
         this.render();
     }
 
+    /** Чистое состояние правой колонки. Режим наследуется от текущего пункта. */
+    freshState(modeIndex = this.modeIndex ?? 0) {
+        return {
+            // Вторая колонка: сервисы выбранной команды. Модалок нет — Enter по
+            // команде просто переводит фокус вправо.
+            // Выбор храним идентификатором, а не индексом: список сервисов меняется
+            // от фильтра, список джоб — от обновления пайплайна, и индекс начинает
+            // указывать на чужую строку.
+            services: { command: null, items: [], selectedRel: null, filter: '' },
+            jobs: { pipelineId: null, selectedJobId: null },
+            trace: { jobId: null, buffer: null },
+            search: { active: false, pattern: '', matches: [], position: 0 },
+            autoScroll: true,
+            modeIndex,
+            scroll: 0,
+        };
+    }
+
+    /**
+     * Переключение пункта слева: складываем состояние прежнего и достаём состояние
+     * нового. Благодаря этому возврат к задаче или команде выглядит так, как ты её
+     * оставил — с тем же фильтром, режимом, поиском и прокруткой.
+     */
+    syncActiveKey() {
+        const row = this.model.selected();
+        const key = row?.key ?? null;
+        if (key === this.activeKey) {
+            return;
+        }
+        this.captureState();
+        this.activeKey = key;
+        if (!key) {
+            return;
+        }
+        let state = this.states.get(key);
+        if (!state) {
+            state = this.freshState();
+            this.states.set(key, state);
+        }
+        this.services = state.services;
+        this.jobs = state.jobs;
+        this.trace = state.trace;
+        this.search = state.search;
+        this.autoScroll = state.autoScroll;
+        this.modeIndex = state.modeIndex;
+        this.pendingScroll = state.scroll;
+    }
+
+    captureState() {
+        if (!this.activeKey) {
+            return;
+        }
+        const state = this.states.get(this.activeKey);
+        if (!state) {
+            return;
+        }
+        state.services = this.services;
+        state.jobs = this.jobs;
+        state.trace = this.trace;
+        state.search = this.search;
+        state.autoScroll = this.autoScroll;
+        state.modeIndex = this.modeIndex;
+        const scroll = this.right?.getScroll?.();
+        if (typeof scroll === 'number') {
+            state.scroll = scroll;
+        }
+    }
+
     runMode() {
         return RUN_MODES[this.modeIndex];
     }
@@ -1211,7 +1279,7 @@ class HomeView extends View {
      * или трассу выбранной джобы.
      */
     rightContext() {
-        if (this.trace.job) {
+        if (this.trace.jobId !== null) {
             return 'trace';
         }
         const kind = this.model.selected()?.kind;
@@ -1237,8 +1305,24 @@ class HomeView extends View {
         return this.app.pipelines?.jobs(pipeline.id) ?? [];
     }
 
+    /** Индекс выводится из id, а не хранится: список джоб пересоздаётся при обновлении. */
+    jobCursor() {
+        const jobs = this.visibleJobs();
+        const found = jobs.findIndex((job) => job.id === this.jobs.selectedJobId);
+        return found >= 0 ? found : 0;
+    }
+
     selectedJob() {
-        return this.visibleJobs()[this.jobs.cursor] ?? null;
+        return this.visibleJobs()[this.jobCursor()] ?? null;
+    }
+
+    moveJobCursor(delta) {
+        const jobs = this.visibleJobs();
+        if (jobs.length === 0) {
+            return;
+        }
+        const next = Math.max(0, Math.min(jobs.length - 1, this.jobCursor() + delta));
+        this.jobs.selectedJobId = jobs[next].id;
     }
 
     /** Список сервисов идёт за курсором левой колонки, без нажатий. */
@@ -1261,8 +1345,24 @@ class HomeView extends View {
         );
     }
 
+    /** То же и для сервисов: индекс считаем от выбранного rel, фильтр его не сбивает. */
+    serviceCursor() {
+        const rows = this.visibleServices();
+        const found = rows.findIndex((pkg) => pkg.rel === this.services.selectedRel);
+        return found >= 0 ? found : 0;
+    }
+
     selectedService() {
-        return this.visibleServices()[this.services.cursor] ?? null;
+        return this.visibleServices()[this.serviceCursor()] ?? null;
+    }
+
+    moveServiceCursor(delta) {
+        const rows = this.visibleServices();
+        if (rows.length === 0) {
+            return;
+        }
+        const next = Math.max(0, Math.min(rows.length - 1, this.serviceCursor() + delta));
+        this.services.selectedRel = rows[next].rel;
     }
 
     unmount() {
@@ -1281,6 +1381,9 @@ class HomeView extends View {
     }
 
     render() {
+        // Порядок важен: сперва подменяем состояние под выбранный пункт, потом
+        // синхронизируем сервисы — иначе фильтр применится к прежнему состоянию.
+        this.syncActiveKey();
         // Синхронизация тут, а не только на движении курсора: иначе после возврата
         // из лога на команду правая колонка оставалась пустой до следующей стрелки.
         this.syncServices();
@@ -1300,8 +1403,6 @@ class HomeView extends View {
         // иначе нижние элементы просто не показываются.
         this.side.scrollTo(cursor);
 
-        // Левая колонка тоже длинная: команды плюс все задачи.
-        this.side.scrollTo(cursor);
         const context = this.rightContext();
         if (context === 'services') {
             this.renderServices();
@@ -1312,6 +1413,14 @@ class HomeView extends View {
         } else {
             this.renderLog();
         }
+        // Прокрутку возвращаем после наполнения колонки: до setContent blessed
+        // ещё не знает высоту содержимого и обрежет позицию.
+        if (this.pendingScroll !== null) {
+            if (!this.autoScroll && this.pendingScroll > 0) {
+                this.right.scrollTo(this.pendingScroll);
+            }
+            this.pendingScroll = null;
+        }
         this.side.style.border = { fg: this.focus === 'side' ? 'cyan' : 'white' };
         this.right.style.border = { fg: this.focus === 'right' ? 'cyan' : 'white' };
     }
@@ -1319,7 +1428,7 @@ class HomeView extends View {
     renderServices() {
         const command = this.services.command;
         const rows = this.visibleServices();
-        this.services.cursor = Math.min(this.services.cursor, Math.max(0, rows.length - 1));
+        const cursor = this.serviceCursor();
         // Режим и фильтр живут в заголовке рамки, а не в содержимом: содержимое
         // скроллится вслед за курсором и увозило бы их за край.
         const filter = this.services.filter ? `/${this.services.filter}` : 'без фильтра';
@@ -1330,7 +1439,7 @@ class HomeView extends View {
             rows.length === 0
                 ? ['{grey-fg}Ничего не найдено.{/}']
                 : rows.map((pkg, position) => {
-                      const active = this.focus === 'right' && position === this.services.cursor;
+                      const active = this.focus === 'right' && position === cursor;
                       return active
                           ? `{inverse}${pkg.rel} (${pkg.name}){/}`
                           : `${pkg.rel} {grey-fg}(${pkg.name}){/}`;
@@ -1338,7 +1447,7 @@ class HomeView extends View {
         this.right.setContent(body.join('\n'));
         // Курсор в списке из 43 сервисов уезжает за край окна — держим его в виду.
         if (this.focus === 'right') {
-            this.right.scrollTo(this.services.cursor);
+            this.right.scrollTo(cursor);
         }
     }
 
@@ -1355,21 +1464,29 @@ class HomeView extends View {
             this.right.setContent('{grey-fg}Джобы ещё не загружены — Enter или r.{/}');
             return;
         }
-        this.jobs.cursor = Math.min(this.jobs.cursor, jobs.length - 1);
+        const cursor = this.jobCursor();
         const lines = jobs.map((job, position) => {
             const duration = job.duration ? `${Math.round(job.duration)}s` : '-';
             const text = `${gitlabIcon(job.status)} ${job.stage} / ${job.name}  ${duration}`;
-            const active = this.focus === 'right' && position === this.jobs.cursor;
+            const active = this.focus === 'right' && position === cursor;
             return active ? `{inverse}${text}{/}` : text;
         });
         this.right.setContent(lines.join('\n'));
         if (this.focus === 'right') {
-            this.right.scrollTo(this.jobs.cursor);
+            this.right.scrollTo(cursor);
         }
     }
 
+    /** Джобу для трассы ищем по id: список мог перезагрузиться. */
+    traceJob() {
+        if (this.trace.jobId === null) {
+            return null;
+        }
+        return this.visibleJobs().find((job) => job.id === this.trace.jobId) ?? null;
+    }
+
     renderTrace() {
-        const job = this.trace.job;
+        const job = this.traceJob() ?? { stage: '?', name: `#${this.trace.jobId}` };
         const searchSuffix = this.search.active
             ? `[/${this.search.pattern} ${this.search.matches.length} совп.] `
             : '';
@@ -1456,7 +1573,7 @@ class HomeView extends View {
             }
         }
         if (this.rightContext() === 'trace' && (name === 'escape' || name === 'left')) {
-            this.trace = { job: null, buffer: null };
+            this.trace = { jobId: null, buffer: null };
             this.search = { active: false, pattern: '', matches: [], position: 0 };
             this.render();
             return true;
@@ -1633,11 +1750,7 @@ class HomeView extends View {
     handleJobsKey(chunk, key) {
         const name = key?.name;
         if (name === 'up' || name === 'down') {
-            const limit = this.visibleJobs().length - 1;
-            this.jobs.cursor = Math.max(
-                0,
-                Math.min(limit, this.jobs.cursor + (name === 'down' ? 1 : -1))
-            );
+            this.moveJobCursor(name === 'down' ? 1 : -1);
             this.render();
             return true;
         }
@@ -1658,7 +1771,7 @@ class HomeView extends View {
 
     async openTrace(job) {
         const store = this.app.pipelines;
-        this.trace = { job, buffer: new LogBuffer() };
+        this.trace = { jobId: job.id, buffer: new LogBuffer() };
         this.autoScroll = true;
         this.render();
         this.app.render();
@@ -1676,11 +1789,7 @@ class HomeView extends View {
     handleServicesKey(chunk, key) {
         const name = key?.name;
         if (name === 'up' || name === 'down') {
-            const limit = this.visibleServices().length - 1;
-            this.services.cursor = Math.max(
-                0,
-                Math.min(limit, this.services.cursor + (name === 'down' ? 1 : -1))
-            );
+            this.moveServiceCursor(name === 'down' ? 1 : -1);
             this.render();
             return true;
         }
@@ -1723,7 +1832,8 @@ class HomeView extends View {
         }
         if (!key?.ctrl && !key?.meta && typeof chunk === 'string' && chunk.length === 1 && chunk >= ' ') {
             this.services.filter += chunk;
-            this.services.cursor = 0;
+            // Выбор не сбрасываем: если отфильтрованный список всё ещё содержит
+            // выбранный сервис, курсор остаётся на нём.
             this.render();
             return true;
         }
