@@ -454,7 +454,9 @@ test('Task считает время работы в mm:ss', () => {
 });
 
 test('TaskManager запускает задачу с правильным spawn и эмитит changed', () => {
-    const { manager, spawned } = makeManager();
+    // Платформу фиксируем: detached и shell от неё зависят, иначе тест зелёный на
+    // одной ОС и красный на другой. Обе платформы проверяет отдельный тест ниже.
+    const { manager, spawned } = makeManager([], { platform: 'linux' });
     let changes = 0;
     manager.on('changed', () => {
         changes += 1;
@@ -466,8 +468,6 @@ test('TaskManager запускает задачу с правильным spawn 
     assert.equal(task.status, 'running');
     assert.deepEqual(spawned[0].args.slice(-4), ['run', 'build', '--workspace', 'apps/api']);
     assert.equal(spawned[0].options.cwd, '/repo');
-    assert.equal(spawned[0].options.detached, false);
-    assert.equal(spawned[0].options.shell, false);
     assert.deepEqual(spawned[0].options.stdio, ['ignore', 'pipe', 'pipe']);
     assert.equal(changes, 1);
 });

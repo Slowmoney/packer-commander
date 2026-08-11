@@ -867,7 +867,7 @@ class TaskManager extends EventEmitter {
     }
 
     start({ command, workspace, runMode = 'default' }) {
-        const npmCommand = new NpmCommand({ command, workspace, runMode });
+        const npmCommand = new NpmCommand({ command, workspace, runMode, platform: this.platform });
         const task = new Task({ id: this.idFactory(), npmCommand, ...this.taskOptions });
         const target = npmCommand.spawnTarget();
         const child = this.spawnImpl(target.command, target.args, {
@@ -888,7 +888,7 @@ class TaskManager extends EventEmitter {
     }
 
     runForeground({ command, workspace, runMode = 'default' }) {
-        const npmCommand = new NpmCommand({ command, workspace, runMode });
+        const npmCommand = new NpmCommand({ command, workspace, runMode, platform: this.platform });
         const target = npmCommand.spawnTarget();
         const result = this.spawnSyncImpl(target.command, target.args, {
             cwd: this.repoRoot,
