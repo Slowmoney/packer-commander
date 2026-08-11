@@ -488,9 +488,38 @@ test('SidePanelModel держит курсор на той же задаче п�
     );
 });
 
-test('SidePanelModel клампит курсор, если выбранный элемент исчез', () => {
+test('SidePanelModel после d остаётся на соседней задаче, а не прыгает в начало', () => {
+    const root = makeRepo({
+        'apps/api': { name: '@ssmm/api', scripts: { build: 'tsc', serve: 'node .' } },
+    });
+    const index = new WorkspaceIndex({ repoRoot: root });
+    index.refresh();
+    const children = [fakeChild(1), fakeChild(2), fakeChild(3)];
+    const { manager } = makeManager(children);
+    for (const workspace of ['apps/a', 'apps/b', 'apps/c']) {
+        manager.start({ command: 'build', workspace });
+    }
+    for (const child of children) {
+        child.emit('close', 0, null);
+    }
+    const model = new SidePanelModel({ index, manager });
+    model.rebuild();
+
+    // Завершённые идут новыми первыми: id3, id2, id1. Стоим на среднем и забываем его.
+    model.selectKey('task:id2');
+    const positionBefore = model.cursorRowIndex();
+    manager.forget('id2');
+    model.rebuild();
+
+    assert.equal(model.cursorRowIndex(), positionBefore, 'позиция курсора не сдвинулась');
+    assert.equal(model.selected().key, 'task:id1', 'курсор на соседней задаче');
+});
+
+test('SidePanelModel уходит в начало только когда позади не осталось выбираемых строк', () => {
     const { model, manager, child } = modelFixture();
-    model.selectKey('task:id1');
+    // Забываем единственную задачу, стоя на первой команде: секции задач пустеют,
+    // и ближайшая выбираемая строка — как раз первая команда.
+    model.selectKey('command:build');
     child.emit('close', 0, null);
     manager.forget('id1');
     model.rebuild();

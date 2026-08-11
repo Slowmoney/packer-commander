@@ -996,9 +996,21 @@ class SidePanelModel {
                 return;
             }
         }
-        const first = this.items.findIndex((row) => row.selectable);
-        this.cursor = first >= 0 ? first : 0;
+        // Элемент исчез (задачу забыли или она уехала в другую секцию) — остаёмся
+        // на той же позиции, а не прыгаем в начало списка.
+        const target = Math.max(0, Math.min(this.cursor, this.items.length - 1));
+        const next = this.#nearestSelectable(target, 1) ?? this.#nearestSelectable(target, -1);
+        this.cursor = next ?? 0;
         this.cursorKey = this.items[this.cursor]?.key ?? null;
+    }
+
+    #nearestSelectable(from, step) {
+        for (let index = from; index >= 0 && index < this.items.length; index += step) {
+            if (this.items[index].selectable) {
+                return index;
+            }
+        }
+        return null;
     }
 }
 
