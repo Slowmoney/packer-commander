@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { EventEmitter } = require('node:events');
 
 const {
     DockerCli,
@@ -12,6 +13,13 @@ const {
     parseImagesOutput,
     ComposeStore,
     createComposeStore,
+    DockerCommand,
+    TaskManager,
+    ImageCatalog,
+    RegistryLookup,
+    GitLabClient,
+    imageReferenceForService,
+    rollbackTargets,
 } = require('../src/task-runner.js');
 
 const cli = () => new DockerCli({ composeFile: '/srv/app/docker-compose.yml' });
@@ -120,6 +128,107 @@ test('DockerRunner превращает отсутствие docker в код 12
     assert.equal(result.status, 127);
     assert.match(result.stderr, /ENOENT/);
     assert.equal(result.stdout, '');
+});
+
+function fakeChild(pid = 4242) {
+    const child = new EventEmitter();
+    child.pid = pid;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.kill = () => true;
+    return child;
+}
+
+function sequenceManager(children) {
+    const spawnedArgs = [];
+    const manager = new TaskManager({
+        repoRoot: '/repo',
+        platform: 'linux',
+        spawnImpl: (command, args) => {
+            spawnedArgs.push(args.join(' '));
+            return children[spawnedArgs.length - 1] ?? fakeChild(99);
+        },
+        idFactory: () => `seq${spawnedArgs.length + 1}`,
+        taskOptions: { platform: 'linux', killImpl: () => {} },
+    });
+    return { manager, spawnedArgs };
+}
+
+test('startSequence выполняет шаги по очереди и складывает вывод в один лог', () => {
+    const children = [fakeChild(11), fakeChild(12)];
+    const { manager, spawnedArgs } = sequenceManager(children);
+
+    const task = manager.startSequence({
+        label: 'обновить api',
+        targets: [
+            { command: 'docker', args: ['compose', 'pull', 'api'], shell: false },
+            { command: 'docker', args: ['compose', 'up', '-d', 'api'], shell: false },
+        ],
+    });
+
+    assert.deepEqual(spawnedArgs, ['compose pull api'], 'второй шаг ещё не начат');
+    children[0].stdout.emit('data', 'pulled\n');
+    children[0].emit('close', 0, null);
+
+    assert.equal(task.status, 'running', 'задача жива между шагами');
+    assert.deepEqual(spawnedArgs, ['compose pull api', 'compose up -d api']);
+    children[1].stdout.emit('data', 'started\n');
+    children[1].emit('close', 0, null);
+
+    assert.equal(task.status, 'finished');
+    const text = task.log
+        .lines()
+        .map((line) => line.text)
+        .join('\n');
+    assert.match(text, /pulled/);
+    assert.match(text, /started/);
+});
+
+test('startSequence прерывает цепочку на ненулевом коде', () => {
+    const child = fakeChild(21);
+    const { manager, spawnedArgs } = sequenceManager([child]);
+
+    const task = manager.startSequence({
+        label: 'обновить api',
+        targets: [
+            { command: 'docker', args: ['compose', 'pull', 'api'], shell: false },
+            { command: 'docker', args: ['compose', 'up', '-d', 'api'], shell: false },
+        ],
+    });
+
+    child.emit('close', 1, null);
+
+    assert.equal(task.status, 'failed');
+    assert.equal(spawnedArgs.length, 1, 'второй шаг не запускался');
+    assert.match(
+        task.log
+            .lines()
+            .map((line) => line.text)
+            .join('\n'),
+        /шаг 1 из 2 завершился с кодом 1/
+    );
+});
+
+test('startDocker делает задачу из одной команды docker', () => {
+    const { manager, spawnedArgs } = sequenceManager([fakeChild(31)]);
+    const target = new DockerCli({ composeFile: '/c.yml' }).logs('api');
+
+    const task = manager.startDocker({ label: 'logs api', target, service: 'api' });
+
+    assert.equal(task.spec.label(), 'logs api');
+    assert.equal(task.workspace, 'api');
+    assert.deepEqual(spawnedArgs, [target.args.join(' ')]);
+});
+
+test('DockerCommand выглядит для задачи так же, как NpmCommand', () => {
+    const target = new DockerCli({ composeFile: '/c.yml' }).logs('api');
+    const spec = new DockerCommand({ label: 'logs api', target, service: 'api' });
+
+    assert.equal(spec.label(), 'logs api');
+    assert.deepEqual(spec.spawnTarget(), target);
+    assert.deepEqual(spec.args(), target.args);
+    assert.equal(spec.workspace, 'api');
+    assert.equal(spec.runMode, 'default');
 });
 
 test('ComposeProject находит файл вверх по дереву и читает name', () => {
@@ -237,6 +346,197 @@ test('parseImagesOutput собирает образы с digest и отбрас�
     assert.equal(parsed[1].tag, null, 'тег <none> — это отсутствие тега');
     assert.equal(parsed[0].id, '111');
     assert.equal(parsed[0].createdAt instanceof Date, true);
+});
+
+function catalogFixture({ registry = null } = {}) {
+    const runs = [];
+    const runner = {
+        run: (target) => {
+            const args = target.args.join(' ');
+            runs.push(args);
+            if (args.startsWith('images')) {
+                return {
+                    status: 0,
+                    stdout: [
+                        '{"Repository":"repo/app","Tag":"api","Digest":"sha256:aaa","CreatedAt":"2026-08-12 21:04:11 +0300 MSK","ID":"1"}',
+                        '{"Repository":"repo/app","Tag":"<none>","Digest":"sha256:bbb","CreatedAt":"2026-08-11 18:22:00 +0300 MSK","ID":"2"}',
+                    ].join('\n'),
+                    stderr: '',
+                };
+            }
+            if (args.startsWith('image inspect')) {
+                return { status: 0, stdout: '["repo/app@sha256:bbb"]\n', stderr: '' };
+            }
+            if (args.startsWith('inspect')) {
+                return { status: 0, stdout: 'sha256:imageid\n', stderr: '' };
+            }
+            return { status: 1, stdout: '', stderr: 'неизвестная команда' };
+        },
+    };
+    const catalog = new ImageCatalog({
+        cli: new DockerCli({ composeFile: '/c.yml' }),
+        runner,
+        registry,
+    });
+    return { catalog, runs };
+}
+
+test('ImageCatalog сливает локальные образы и помечает запущенный', async () => {
+    const { catalog } = catalogFixture();
+
+    const { items } = await catalog.build({ repo: 'repo/app', tag: 'api', container: 'api-1' });
+
+    assert.deepEqual(
+        items.map((item) => item.digest),
+        ['sha256:aaa', 'sha256:bbb'],
+        'сортировка по дате вниз'
+    );
+    assert.deepEqual(items[0].sources, ['local']);
+    assert.equal(items[0].isCurrent, false);
+    assert.equal(items[1].isCurrent, true, 'запущен старый образ');
+});
+
+test('ImageCatalog добавляет digest из реестра и не дублирует локальный', async () => {
+    const { catalog } = catalogFixture({
+        registry: {
+            tagDigest: async () => ({ digest: 'sha256:aaa', createdAt: new Date('2026-08-12') }),
+        },
+    });
+
+    const { items, registryReason } = await catalog.build({
+        repo: 'repo/app',
+        tag: 'api',
+        container: 'api-1',
+    });
+
+    assert.equal(registryReason, '');
+    const current = items.find((item) => item.digest === 'sha256:aaa');
+    assert.deepEqual(current.sources, ['local', 'registry']);
+    assert.equal(items.length, 2, 'реестровый digest совпал с локальным — записей всё ещё две');
+});
+
+test('ImageCatalog переживает недоступный реестр', async () => {
+    const { catalog } = catalogFixture({
+        registry: {
+            tagDigest: async () => {
+                throw new Error('GitLab 403 /registry');
+            },
+        },
+    });
+
+    const { items, registryReason } = await catalog.build({
+        repo: 'repo/app',
+        tag: 'api',
+        container: 'api-1',
+    });
+
+    assert.equal(items.length, 2, 'локальные образы на месте');
+    assert.match(registryReason, /403/);
+});
+
+test('RegistryLookup находит репозиторий реестра по имени и отдаёт digest тега', async () => {
+    const calls = [];
+    const lookup = new RegistryLookup({
+        repo: 'registry.gitlab.com/g/app',
+        client: {
+            registryRepositories: async () => {
+                calls.push('repos');
+                return [
+                    { id: 3, location: 'registry.gitlab.com/g/other' },
+                    { id: 7, location: 'registry.gitlab.com/g/app' },
+                ];
+            },
+            registryTag: async (repositoryId, tagName) => {
+                calls.push(`tag:${repositoryId}:${tagName}`);
+                return { name: tagName, digest: 'sha256:ccc', created_at: '2026-08-10T09:15:00Z' };
+            },
+        },
+    });
+
+    const first = await lookup.tagDigest('api');
+    assert.equal(first.digest, 'sha256:ccc');
+    assert.equal(first.createdAt.toISOString(), '2026-08-10T09:15:00.000Z');
+
+    await lookup.tagDigest('api');
+    assert.deepEqual(calls, ['repos', 'tag:7:api', 'tag:7:api'], 'список репозиториев кешируется');
+});
+
+test('RegistryLookup отдаёт null, когда репозитория нет в реестре', async () => {
+    const lookup = new RegistryLookup({
+        repo: 'registry.gitlab.com/g/app',
+        client: { registryRepositories: async () => [], registryTag: async () => ({}) },
+    });
+
+    assert.equal(await lookup.tagDigest('api'), null);
+});
+
+test('GitLabClient умеет реестр', async () => {
+    const calls = [];
+    const client = new GitLabClient({
+        host: 'gitlab.com',
+        projectPath: 'g/app',
+        token: 't',
+        fetchImpl: async (url) => {
+            calls.push(url);
+            return {
+                ok: true,
+                status: 200,
+                json: async () => ({ name: 'api', digest: 'sha256:ccc', created_at: '2026-08-10' }),
+                text: async () => '',
+            };
+        },
+    });
+
+    await client.registryRepositories();
+    await client.registryTag(7, 'api');
+
+    assert.match(calls[0], /\/registry\/repositories\?tags=true&per_page=100$/);
+    assert.match(calls[1], /\/registry\/repositories\/7\/tags\/api$/);
+});
+
+test('imageReferenceForService разбирает образ контейнера', () => {
+    assert.deepEqual(imageReferenceForService({ image: 'registry.gitlab.com/g/app:api' }), {
+        repo: 'registry.gitlab.com/g/app',
+        tag: 'api',
+    });
+    assert.deepEqual(imageReferenceForService({ image: 'nginx' }), {
+        repo: 'nginx',
+        tag: 'latest',
+    });
+    assert.equal(imageReferenceForService({ image: '' }), null);
+});
+
+test('rollbackTargets пропускает pull для локального образа', () => {
+    const dockerCli = new DockerCli({ composeFile: '/c.yml' });
+    const withPull = rollbackTargets({
+        cli: dockerCli,
+        repo: 'repo/app',
+        tag: 'api',
+        digest: 'sha256:bbb',
+        service: 'api',
+        alreadyLocal: false,
+    });
+    assert.deepEqual(
+        withPull.map((target) => target.args[0]),
+        ['pull', 'tag', 'compose']
+    );
+    assert.deepEqual(withPull[0].args, ['pull', 'repo/app@sha256:bbb']);
+    assert.deepEqual(withPull[1].args, ['tag', 'repo/app@sha256:bbb', 'repo/app:api']);
+    assert.deepEqual(withPull[2].args.slice(-4), ['up', '-d', '--no-deps', 'api']);
+
+    const localOnly = rollbackTargets({
+        cli: dockerCli,
+        repo: 'repo/app',
+        tag: 'api',
+        digest: 'sha256:bbb',
+        service: 'api',
+        alreadyLocal: true,
+    });
+    assert.deepEqual(
+        localOnly.map((target) => target.args[0]),
+        ['tag', 'compose'],
+        'скачивать нечего'
+    );
 });
 
 function storeFixture(psOutput, { status = 0 } = {}) {

@@ -51,7 +51,7 @@ function fakeChild(pid = 4242) {
 function makeTask({ child = null, ...options } = {}) {
     const task = new Task({
         id: 'id1',
-        npmCommand: new NpmCommand({ command: 'build', workspace: 'apps/api' }),
+        spec: new NpmCommand({ command: 'build', workspace: 'apps/api' }),
         now: () => 1000,
         ...options,
     });

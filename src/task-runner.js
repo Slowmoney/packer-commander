@@ -872,6 +872,15 @@ class GitLabClient {
         return this.request(`/jobs/${jobId}/trace`, {}, { raw: true });
     }
 
+    /** Реестр контейнеров. Токену нужен scope read_registry. */
+    registryRepositories() {
+        return this.request('/registry/repositories', { tags: 'true', per_page: '100' });
+    }
+
+    registryTag(repositoryId, tagName) {
+        return this.request(`/registry/repositories/${repositoryId}/tags/${tagName}`);
+    }
+
     /** POST — нужен токен со scope "api", read_api для запуска не хватит. */
     createPipeline(ref) {
         return this.request('/pipeline', { ref }, { method: 'POST' });
@@ -1010,6 +1019,217 @@ class PipelineStore extends EventEmitter {
     }
 }
 
+/** Одиночная команда docker в виде спеки задачи. */
+class DockerCommand {
+    constructor({ label, target, service = null }) {
+        this.text = label;
+        this.target = target;
+        this.workspace = service;
+        this.command = label;
+        this.runMode = 'default';
+    }
+
+    label() {
+        return this.text;
+    }
+
+    args() {
+        return this.target.args;
+    }
+
+    spawnTarget() {
+        return this.target;
+    }
+}
+
+/**
+ * Спека из нескольких шагов: pull → up -d, pull → tag → up -d. Для задачи это
+ * одна сущность с одним логом; шаги идут по очереди.
+ */
+class CommandSequence {
+    constructor({ label, targets, workspace = null }) {
+        this.text = label;
+        this.targets = targets;
+        this.workspace = workspace;
+        this.command = label;
+        this.runMode = 'default';
+        this.index = 0;
+    }
+
+    get size() {
+        return this.targets.length;
+    }
+
+    label() {
+        return this.text;
+    }
+
+    spawnTarget() {
+        return this.targets[this.index];
+    }
+
+    /** Сдвигает шаг вперёд и отдаёт его, либо null, если цепочка кончилась. */
+    next() {
+        this.index += 1;
+        return this.targets[this.index] ?? null;
+    }
+}
+
+/**
+ * Мостик между GitLab и каталогом образов: находит id репозитория реестра по его
+ * имени и отдаёт digest тега. Список репозиториев запрашивается один раз.
+ */
+class RegistryLookup {
+    constructor({ client, repo }) {
+        this.client = client;
+        this.repo = repo;
+        this.repositoryId = null;
+    }
+
+    async #findRepositoryId() {
+        if (this.repositoryId !== null) {
+            return this.repositoryId;
+        }
+        const repositories = await this.client.registryRepositories();
+        const found = (Array.isArray(repositories) ? repositories : []).find((repository) => {
+            const location = String(repository.location ?? repository.path ?? '');
+            return location === this.repo || location.endsWith(`/${this.repo}`);
+        });
+        this.repositoryId = found ? found.id : null;
+        return this.repositoryId;
+    }
+
+    async tagDigest(tag) {
+        const repositoryId = await this.#findRepositoryId();
+        if (repositoryId === null) {
+            return null;
+        }
+        const details = await this.client.registryTag(repositoryId, tag);
+        if (!details?.digest) {
+            return null;
+        }
+        return { digest: details.digest, createdAt: parseDockerDate(details.created_at) };
+    }
+}
+
+/**
+ * Кандидаты для отката. Основной источник — локальный кеш: там лежат прежние
+ * образы, потерявшие тег после нового пуша. Реестр отдаёт только текущий digest
+ * тега, поэтому он справочный, а не исторический.
+ */
+class ImageCatalog {
+    constructor({ cli, runner, registry = null }) {
+        this.cli = cli;
+        this.runner = runner;
+        this.registry = registry;
+    }
+
+    currentDigest({ container, repo }) {
+        const inspected = this.runner.run(this.cli.inspectContainerImage(container));
+        if (inspected.status !== 0) {
+            return null;
+        }
+        const imageId = inspected.stdout.trim();
+        if (!imageId) {
+            return null;
+        }
+        const digests = this.runner.run(this.cli.imageDigests(imageId));
+        if (digests.status !== 0) {
+            return null;
+        }
+        let references = [];
+        try {
+            references = JSON.parse(digests.stdout.trim() || '[]');
+        } catch {
+            return null;
+        }
+        const match = references.find((reference) => String(reference).startsWith(`${repo}@`));
+        return match ? String(match).split('@')[1] : null;
+    }
+
+    async build({ repo, tag, container, registry = this.registry }) {
+        const local = this.runner.run(this.cli.images(repo));
+        const byDigest = new Map();
+        if (local.status === 0) {
+            for (const image of parseImagesOutput(local.stdout)) {
+                byDigest.set(image.digest, {
+                    digest: image.digest,
+                    tags: image.tag ? [image.tag] : [],
+                    sources: ['local'],
+                    createdAt: image.createdAt,
+                    isCurrent: false,
+                });
+            }
+        }
+
+        let registryReason = '';
+        if (registry) {
+            try {
+                const found = await registry.tagDigest(tag);
+                if (found?.digest) {
+                    const existing = byDigest.get(found.digest);
+                    if (existing) {
+                        if (!existing.sources.includes('registry')) {
+                            existing.sources.push('registry');
+                        }
+                    } else {
+                        byDigest.set(found.digest, {
+                            digest: found.digest,
+                            tags: [tag],
+                            sources: ['registry'],
+                            createdAt: found.createdAt ?? null,
+                            isCurrent: false,
+                        });
+                    }
+                }
+            } catch (error) {
+                registryReason = error.message;
+            }
+        }
+
+        const current = container ? this.currentDigest({ container, repo }) : null;
+        if (current && byDigest.has(current)) {
+            byDigest.get(current).isCurrent = true;
+        }
+
+        const items = [...byDigest.values()].sort((a, b) => {
+            const left = a.createdAt ? a.createdAt.getTime() : 0;
+            const right = b.createdAt ? b.createdAt.getTime() : 0;
+            return right - left;
+        });
+        return { items, registryReason };
+    }
+}
+
+/** Из "registry.gitlab.com/g/app:api" получаем репозиторий и тег. */
+function imageReferenceForService(container) {
+    const image = String(container?.image ?? '').trim();
+    if (!image) {
+        return null;
+    }
+    const lastColon = image.lastIndexOf(':');
+    const lastSlash = image.lastIndexOf('/');
+    if (lastColon > lastSlash) {
+        return { repo: image.slice(0, lastColon), tag: image.slice(lastColon + 1) };
+    }
+    return { repo: image, tag: 'latest' };
+}
+
+/**
+ * Шаги отката. Compose ссылается на изменяемый тег, поэтому вместо правки файла
+ * перевешиваем тег на нужный digest и поднимаем сервис.
+ */
+function rollbackTargets({ cli, repo, tag, digest, service, alreadyLocal }) {
+    const reference = `${repo}@${digest}`;
+    const targets = [];
+    if (!alreadyLocal) {
+        targets.push(cli.pullImage(reference));
+    }
+    targets.push(cli.tag(reference, `${repo}:${tag}`));
+    targets.push(cli.up(service, { noDeps: true }));
+    return targets;
+}
+
 const TERMINAL_STATUSES = new Set(['finished', 'failed', 'stopped']);
 
 /**
@@ -1019,7 +1239,7 @@ const TERMINAL_STATUSES = new Set(['finished', 'failed', 'stopped']);
 class Task extends EventEmitter {
     constructor({
         id,
-        npmCommand,
+        spec,
         now = () => Date.now(),
         killTimeoutMs = KILL_TIMEOUT_MS,
         setTimeoutImpl = setTimeout,
@@ -1034,7 +1254,7 @@ class Task extends EventEmitter {
         this.spawnSyncImpl = spawnSyncImpl;
         this.killImpl = killImpl;
         this.id = id;
-        this.npmCommand = npmCommand;
+        this.spec = spec;
         this.now = now;
         this.killTimeoutMs = killTimeoutMs;
         this.setTimeoutImpl = setTimeoutImpl;
@@ -1047,19 +1267,20 @@ class Task extends EventEmitter {
         this.stoppedAt = null;
         this.child = null;
         this.killTimer = null;
+        this.onStepDone = null;
         this.log = new LogBuffer({ limit: logLimit });
     }
 
     get workspace() {
-        return this.npmCommand.workspace;
+        return this.spec.workspace;
     }
 
     get command() {
-        return this.npmCommand.command;
+        return this.spec.command;
     }
 
     get runMode() {
-        return this.npmCommand.runMode;
+        return this.spec.runMode;
     }
 
     isRunning() {
@@ -1079,6 +1300,10 @@ class Task extends EventEmitter {
             this.exitCode = code ?? null;
             this.signal = signal ?? null;
             this.#emitLines(this.log.flush());
+            // Цепочка: если есть следующий шаг, задача остаётся running.
+            if (this.onStepDone && this.isRunning() && this.onStepDone(code) === true) {
+                return;
+            }
             this.#transition(code === 0 ? 'finished' : 'failed');
         });
     }
@@ -1138,6 +1363,10 @@ class Task extends EventEmitter {
         return `${minutes}:${seconds}`;
     }
 
+    noteStepFailure(step, total, code) {
+        this.#write(`шаг ${step} из ${total} завершился с кодом ${code}\n`, 'stderr');
+    }
+
     #write(chunk, stream) {
         this.#emitLines(this.log.append(chunk, stream));
     }
@@ -1185,11 +1414,9 @@ class TaskManager extends EventEmitter {
         this.items = [];
     }
 
-    start({ command, workspace, runMode = 'default' }) {
-        const npmCommand = new NpmCommand({ command, workspace, runMode, platform: this.platform });
-        const task = new Task({ id: this.idFactory(), npmCommand, ...this.taskOptions });
-        const target = npmCommand.spawnTarget();
-        const child = this.spawnImpl(target.command, target.args, {
+    /** Опции спавна живут в одном месте: их легко нарушить по-разному в трёх копиях. */
+    #spawn(target) {
+        return this.spawnImpl(target.command, target.args, {
             cwd: this.repoRoot,
             // На POSIX процесс становится лидером своей группы — только так стоп
             // сможет прибить и npm, и его детей (node/nest/vite держат порт).
@@ -1199,16 +1426,56 @@ class TaskManager extends EventEmitter {
             shell: target.shell === true,
             windowsHide: true,
         });
-        task.attach(child);
+    }
+
+    #register(task) {
         task.on('status', () => this.emit('changed'));
         this.items.push(task);
         this.emit('changed');
         return task;
     }
 
+    start({ command, workspace, runMode = 'default' }) {
+        const spec = new NpmCommand({ command, workspace, runMode, platform: this.platform });
+        const task = new Task({ id: this.idFactory(), spec, ...this.taskOptions });
+        task.attach(this.#spawn(spec.spawnTarget()));
+        return this.#register(task);
+    }
+
+    /** Одна команда docker как задача: логи, рестарт, стоп. */
+    startDocker({ label, target, service = null }) {
+        const spec = new DockerCommand({ label, target, service });
+        const task = new Task({ id: this.idFactory(), spec, ...this.taskOptions });
+        task.attach(this.#spawn(target));
+        return this.#register(task);
+    }
+
+    /**
+     * Задача из цепочки команд. Между шагами задача остаётся running, ненулевой
+     * код прерывает остаток — в логе видно, на каком шаге всё встало.
+     */
+    startSequence({ label, targets, workspace = null }) {
+        const spec = new CommandSequence({ label, targets, workspace });
+        const task = new Task({ id: this.idFactory(), spec, ...this.taskOptions });
+        task.onStepDone = (code) => {
+            if (code !== 0) {
+                task.noteStepFailure(spec.index + 1, spec.size, code);
+                return false;
+            }
+            const nextTarget = spec.next();
+            if (!nextTarget) {
+                return false;
+            }
+            task.attach(this.#spawn(nextTarget));
+            return true;
+        };
+        task.attach(this.#spawn(spec.spawnTarget()));
+        return this.#register(task);
+    }
+
     runForeground({ command, workspace, runMode = 'default' }) {
-        const npmCommand = new NpmCommand({ command, workspace, runMode, platform: this.platform });
-        const target = npmCommand.spawnTarget();
+        const spec = new NpmCommand({ command, workspace, runMode, platform: this.platform });
+        const target = spec.spawnTarget();
         const result = this.spawnSyncImpl(target.command, target.args, {
             cwd: this.repoRoot,
             stdio: 'inherit',
@@ -2009,7 +2276,7 @@ class HomeView extends View {
             ? `[/${this.search.pattern} ${this.search.matches.length} совп.] `
             : '';
         this.right.setLabel(
-            task ? ` Лог: ${task.npmCommand.label()} ${searchSuffix}` : ` Лог ${searchSuffix}`
+            task ? ` Лог: ${task.spec.label()} ${searchSuffix}` : ` Лог ${searchSuffix}`
         );
         const lines = task ? task.log.lines() : [];
         this.right.setContent(
@@ -2388,7 +2655,7 @@ class TaskDetailsView extends View {
             [
                 `ID:         ${task.id}`,
                 `Статус:     ${task.status}`,
-                `Команда:    ${task.npmCommand.label()}`,
+                `Команда:    ${task.spec.label()}`,
                 `PID:        ${task.pid ?? '-'}`,
                 `Старт:      ${new Date(task.createdAt).toLocaleString()}`,
                 `Финиш:      ${task.stoppedAt ? new Date(task.stoppedAt).toLocaleString() : '-'}`,
@@ -2736,6 +3003,12 @@ module.exports = {
     parseDockerDate,
     ComposeStore,
     createComposeStore,
+    DockerCommand,
+    CommandSequence,
+    RegistryLookup,
+    ImageCatalog,
+    imageReferenceForService,
+    rollbackTargets,
     WorkspaceIndex,
     NpmCommand,
     AnsiTags,
