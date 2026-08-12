@@ -585,3 +585,295 @@ test('foreground-режим снимает и восстанавливает scr
         cleanup();
     }
 });
+
+// --- Docker Compose -----------------------------------------------------------
+
+const {
+    ComposeStore: Store,
+    ComposeProject: Project,
+    DockerCli: Cli,
+} = require('../src/task-runner.js');
+
+function composeStub() {
+    const project = new Project({
+        file: '/srv/app/docker-compose.yml',
+        dir: '/srv/app',
+        name: 'vkboss-light',
+    });
+    return new Store({
+        project,
+        cli: new Cli({ composeFile: project.file }),
+        runner: {
+            run: () => ({
+                status: 0,
+                stdout: [
+                    '{"Service":"gptboss-llm","Name":"gptboss-llm","State":"running","Status":"Up 3 days","Image":"repo/app:gptboss-llm"}',
+                    '{"Service":"gptboss-chat","Name":"gptboss-chat","State":"running","Status":"Up 3 days","Image":"repo/app:gptboss-chat"}',
+                    '{"Service":"gptboss-history","Name":"gptboss-history","State":"exited","Status":"Exited (1) 2 minutes ago","Image":"repo/app:gptboss-history","ExitCode":1}',
+                ].join('\n'),
+                stderr: '',
+            }),
+        },
+    });
+}
+
+async function composeHome(extra = {}) {
+    const compose = composeStub();
+    const harness = bootstrap({ compose, ...extra });
+    await compose.refresh();
+    harness.home.model.rebuild();
+    harness.home.model.selectKey('compose:vkboss-light');
+    harness.home.render();
+    return { ...harness, compose };
+}
+
+test('секция compose: строка проекта слева, контейнеры справа', async () => {
+    const { home, cleanup } = await composeHome();
+    try {
+        assert.match(home.side.content, /Compose/);
+        assert.match(home.side.content, /vkboss-light\s+2\/3/);
+        assert.equal(home.rightContext(), 'containers');
+        assert.match(home.right.content, /весь проект \(3\)/);
+        assert.match(home.right.content, /gptboss-llm/);
+        assert.match(home.right.content, /Exited \(1\)/);
+    } finally {
+        cleanup();
+    }
+});
+
+test('буквы фильтруют контейнеры и ничего не запускают', async () => {
+    const { app, home, press, type, cleanup } = await composeHome();
+    try {
+        press(null, 'right');
+        type('hist');
+
+        assert.equal(home.containers.filter, 'hist');
+        assert.deepEqual(
+            home
+                .visibleContainers()
+                .filter((row) => row.service)
+                .map((row) => row.service),
+            ['gptboss-history']
+        );
+        assert.equal(app.manager.tasks().length, 0, 'ни одна команда не ушла');
+        assert.equal(app.stack.depth, 1, 'модалок нет');
+    } finally {
+        cleanup();
+    }
+});
+
+test('состояние секции compose помнится: фильтр и выбранный контейнер', async () => {
+    const { home, press, type, cleanup } = await composeHome();
+    try {
+        press(null, 'right');
+        type('chat');
+        press(null, 'down');
+        const chosen = home.selectedContainer()?.service;
+        assert.equal(chosen, 'gptboss-chat');
+
+        home.model.selectKey('command:build');
+        home.render();
+        home.model.selectKey('compose:vkboss-light');
+        home.render();
+
+        assert.equal(home.containers.filter, 'chat', 'фильтр восстановлен');
+        assert.equal(home.selectedContainer()?.service, chosen, 'выбор восстановлен');
+    } finally {
+        cleanup();
+    }
+});
+
+test('Enter на контейнере открывает меню, а не запускает', async () => {
+    const { app, press, pressEnter, cleanup } = await composeHome();
+    try {
+        press(null, 'right');
+        press(null, 'down');
+        pressEnter();
+
+        assert.equal(app.stack.depth, 2, 'открылось меню');
+        assert.match(app.stack.top().title, /gptboss-llm/);
+        assert.deepEqual(
+            app.stack.top().items.map((item) => item.value),
+            ['logs', 'update', 'images', 'restart', 'stop']
+        );
+        assert.equal(app.manager.tasks().length, 0, 'ничего не запущено');
+    } finally {
+        cleanup();
+    }
+});
+
+test('пункт «Логи» создаёт задачу с командой docker compose logs', async () => {
+    const { app, press, pressEnter, cleanup } = await composeHome();
+    try {
+        press(null, 'right');
+        press(null, 'down');
+        pressEnter();
+        pressEnter();
+
+        assert.equal(app.stack.depth, 1, 'меню закрылось');
+        const task = app.manager.tasks()[0];
+        assert.match(task.spec.label(), /logs gptboss-llm/);
+        assert.deepEqual(task.spec.spawnTarget().args.slice(-5), [
+            'logs',
+            '-f',
+            '--tail',
+            '200',
+            'gptboss-llm',
+        ]);
+    } finally {
+        cleanup();
+    }
+});
+
+test('пункт «Обновить» требует подтверждения и показывает команды', async () => {
+    const { app, press, pressEnter, cleanup } = await composeHome();
+    try {
+        press(null, 'right');
+        press(null, 'down');
+        pressEnter();
+        press(null, 'down');
+        pressEnter();
+
+        assert.ok(app.stack.top() instanceof ConfirmView, 'спросил подтверждение');
+        assert.match(app.stack.top().text, /pull gptboss-llm/);
+        assert.match(app.stack.top().text, /up -d gptboss-llm/);
+        assert.equal(app.manager.tasks().length, 0);
+
+        press(null, 'n');
+        assert.equal(app.manager.tasks().length, 0, 'отмена ничего не запустила');
+    } finally {
+        cleanup();
+    }
+});
+
+test('подтверждённое обновление запускает цепочку pull → up -d', async () => {
+    const { app, press, pressEnter, cleanup } = await composeHome();
+    try {
+        press(null, 'right');
+        press(null, 'down');
+        pressEnter();
+        press(null, 'down');
+        pressEnter();
+        press(null, 'y');
+
+        const task = app.manager.tasks()[0];
+        assert.equal(task.spec.size, 2, 'цепочка из двух шагов');
+        assert.deepEqual(task.spec.targets[0].args.slice(-2), ['pull', 'gptboss-llm']);
+        assert.deepEqual(task.spec.targets[1].args.slice(-3), ['up', '-d', 'gptboss-llm']);
+    } finally {
+        cleanup();
+    }
+});
+
+test('строка «весь проект» даёт обновление всего с числом сервисов', async () => {
+    const { app, press, pressEnter, cleanup } = await composeHome();
+    try {
+        press(null, 'right');
+        pressEnter();
+        assert.deepEqual(
+            app.stack.top().items.map((item) => item.value),
+            ['update-all', 'logs-all']
+        );
+
+        pressEnter();
+        assert.ok(app.stack.top() instanceof ConfirmView);
+        assert.match(app.stack.top().text, /3 сервис/);
+        press(null, 'y');
+
+        const task = app.manager.tasks()[0];
+        assert.deepEqual(task.spec.targets[0].args.slice(-1), ['pull']);
+        assert.deepEqual(task.spec.targets[1].args.slice(-2), ['up', '-d']);
+    } finally {
+        cleanup();
+    }
+});
+
+test('откат: каталог, подтверждение с digest, цепочка и пометка', async () => {
+    const { app, compose, press, pressEnter, cleanup } = await composeHome({
+        imageCatalogImpl: {
+            build: async () => ({
+                items: [
+                    {
+                        digest: 'sha256:aaa',
+                        tags: ['gptboss-llm'],
+                        sources: ['local'],
+                        createdAt: new Date('2026-08-12T21:04:00Z'),
+                        isCurrent: true,
+                    },
+                    {
+                        digest: 'sha256:bbb',
+                        tags: [],
+                        sources: ['local'],
+                        createdAt: new Date('2026-08-11T18:22:00Z'),
+                        isCurrent: false,
+                    },
+                ],
+                registryReason: '',
+            }),
+        },
+    });
+    try {
+        press(null, 'right');
+        press(null, 'down');
+        pressEnter();
+        press(null, 'down');
+        press(null, 'down');
+        pressEnter();
+        await new Promise(setImmediate);
+        await new Promise(setImmediate);
+
+        assert.match(app.stack.top().title, /Образы gptboss-llm/);
+        assert.match(app.stack.top().items[0].label, /запущен сейчас/);
+        press(null, 'down');
+        pressEnter();
+
+        assert.ok(app.stack.top() instanceof ConfirmView);
+        assert.match(app.stack.top().text, /sha256:bbb/);
+        assert.match(app.stack.top().text, /локальный тег/);
+        press(null, 'y');
+
+        const task = app.manager.tasks()[0];
+        assert.deepEqual(
+            task.spec.targets.map((target) => target.args[0]),
+            ['tag', 'compose'],
+            'образ локальный — pull пропущен'
+        );
+        assert.equal(compose.isPinned('gptboss-llm'), true, 'сервис помечен');
+    } finally {
+        cleanup();
+    }
+});
+
+test('состояние контейнеров опрашивается по тику, пока секция видна', async () => {
+    const { app, compose, cleanup } = await composeHome({ tickMs: 1000 });
+    try {
+        let refreshes = 0;
+        compose.refresh = async () => {
+            refreshes += 1;
+        };
+
+        for (let tick = 0; tick < 5; tick += 1) {
+            app.onTick();
+        }
+
+        assert.equal(refreshes, 1, 'один опрос за 5 секунд, а не на каждый кадр');
+    } finally {
+        cleanup();
+    }
+});
+
+test('r перечитывает состояние контейнеров немедленно', async () => {
+    const { compose, press, cleanup } = await composeHome();
+    try {
+        let refreshes = 0;
+        compose.refresh = async () => {
+            refreshes += 1;
+        };
+
+        press('r', 'r');
+
+        assert.equal(refreshes, 1);
+    } finally {
+        cleanup();
+    }
+});

@@ -1571,10 +1571,11 @@ function taskTail(task) {
 
 /** Плоский список строк левой панели: команды, живые задачи, завершённые. */
 class SidePanelModel {
-    constructor({ index, manager, pipelines = null }) {
+    constructor({ index, manager, pipelines = null, compose = null }) {
         this.index = index;
         this.manager = manager;
         this.pipelines = pipelines;
+        this.compose = compose;
         this.items = [];
         this.cursor = 0;
         this.cursorKey = null;
@@ -1620,6 +1621,7 @@ class SidePanelModel {
             rows.push(this.#taskRow(task));
         }
         this.#pushPipelineRows(rows);
+        this.#pushComposeRows(rows);
 
         this.items = rows;
         this.#restoreCursor();
@@ -1683,6 +1685,27 @@ class SidePanelModel {
                 pipeline,
             });
         }
+    }
+
+    #pushComposeRows(rows) {
+        const store = this.compose;
+        if (!store?.isEnabled()) {
+            return;
+        }
+        const { up, total } = store.counters();
+        rows.push({
+            kind: 'header',
+            key: 'header:compose',
+            label: '🐳 Compose',
+            selectable: false,
+        });
+        rows.push({
+            kind: 'compose',
+            key: `compose:${store.project.name}`,
+            label: `  ${store.project.name}  ${up}/${total}`,
+            selectable: true,
+            compose: store,
+        });
     }
 
     #taskRow(task) {
@@ -1848,6 +1871,7 @@ class HomeView extends View {
             index: app.index,
             manager: app.manager,
             pipelines: app.pipelines,
+            compose: app.compose,
         });
         this.focus = 'side';
         // Показ таймстемпов — глобальная настройка отображения, а не свойство пункта.
@@ -1934,6 +1958,7 @@ class HomeView extends View {
             // от фильтра, список джоб — от обновления пайплайна, и индекс начинает
             // указывать на чужую строку.
             services: { command: null, items: [], selectedRel: null, filter: '' },
+            containers: { filter: '', selectedService: null },
             jobs: { pipelineId: null, selectedJobId: null },
             trace: { jobId: null, buffer: null },
             search: { active: false, pattern: '', matches: [], position: 0 },
@@ -1965,6 +1990,7 @@ class HomeView extends View {
             this.states.set(key, state);
         }
         this.services = state.services;
+        this.containers = state.containers;
         this.jobs = state.jobs;
         this.trace = state.trace;
         this.search = state.search;
@@ -1982,6 +2008,7 @@ class HomeView extends View {
             return;
         }
         state.services = this.services;
+        state.containers = this.containers;
         state.jobs = this.jobs;
         state.trace = this.trace;
         state.search = this.search;
@@ -2013,6 +2040,9 @@ class HomeView extends View {
         const kind = this.model.selected()?.kind;
         if (kind === 'command') {
             return 'services';
+        }
+        if (kind === 'compose') {
+            return 'containers';
         }
         if (kind === 'pipeline') {
             return 'jobs';
@@ -2070,6 +2100,142 @@ class HomeView extends View {
         return this.services.items.filter(
             (pkg) =>
                 pkg.rel.toLowerCase().includes(needle) || pkg.name.toLowerCase().includes(needle)
+        );
+    }
+
+    /**
+     * Первая строка — псевдосервис для операций над всем проектом. Выбор хранится
+     * именем сервиса: список меняется от фильтра и от обновления ps.
+     */
+    visibleContainers() {
+        const store = this.app.compose;
+        if (!store?.isEnabled()) {
+            return [];
+        }
+        const needle = this.containers.filter.toLowerCase();
+        const matched = store
+            .containers()
+            .filter((container) => container.service.toLowerCase().includes(needle));
+        return [
+            { service: null, label: `весь проект (${store.containers().length})` },
+            ...matched.map((container) => ({ ...container, label: container.service })),
+        ];
+    }
+
+    containerCursor() {
+        const rows = this.visibleContainers();
+        const found = rows.findIndex((row) => row.service === this.containers.selectedService);
+        return found >= 0 ? found : 0;
+    }
+
+    selectedContainer() {
+        return this.visibleContainers()[this.containerCursor()] ?? null;
+    }
+
+    moveContainerCursor(delta) {
+        const rows = this.visibleContainers();
+        if (rows.length === 0) {
+            return;
+        }
+        const next = Math.max(0, Math.min(rows.length - 1, this.containerCursor() + delta));
+        this.containers.selectedService = rows[next].service;
+    }
+
+    renderContainers() {
+        const store = this.app.compose;
+        const { up, total } = store.counters();
+        const filter = this.containers.filter ? `/${this.containers.filter}` : 'без фильтра';
+        this.right.setLabel(` ${store.project.name} • ${up}/${total} up • ${filter} `);
+        if (store.status === 'error') {
+            this.right.setContent(`{red-fg}${store.reason}{/}`);
+            return;
+        }
+        const rows = this.visibleContainers();
+        const cursor = this.containerCursor();
+        const lines = rows.map((row, position) => {
+            const active = this.focus === 'right' && position === cursor;
+            const text = row.service === null ? `▸ ${row.label}` : this.containerLine(row);
+            return active ? `{inverse}${stripTags(text)}{/}` : text;
+        });
+        this.right.setContent(lines.join('\n'));
+        if (this.focus === 'right') {
+            this.right.scrollTo(cursor);
+        }
+    }
+
+    containerLine(container) {
+        const icon = container.state === 'running' ? '{green-fg}●{/}' : '{red-fg}✗{/}';
+        const pinned = this.app.compose.isPinned(container.service)
+            ? '  {yellow-fg}⇤ локально переопределён{/}'
+            : '';
+        return `${icon} ${container.service}  {grey-fg}${container.status}{/}${pinned}`;
+    }
+
+    /** Буквы тут — фильтр, поэтому действия висят на Enter и живут в меню. */
+    handleContainersKey(chunk, key) {
+        const name = key?.name;
+        if (name === 'up' || name === 'down') {
+            this.moveContainerCursor(name === 'down' ? 1 : -1);
+            this.render();
+            return true;
+        }
+        if (CONFIRM_KEYS.has(name)) {
+            const row = this.selectedContainer();
+            if (row) {
+                this.openContainerMenu(row);
+            }
+            return true;
+        }
+        if (name === 'backspace') {
+            if (this.containers.filter.length === 0) {
+                return false;
+            }
+            this.containers.filter = this.containers.filter.slice(0, -1);
+            this.render();
+            return true;
+        }
+        if (
+            !key?.ctrl &&
+            !key?.meta &&
+            typeof chunk === 'string' &&
+            chunk.length === 1 &&
+            chunk >= ' '
+        ) {
+            this.containers.filter += chunk;
+            this.render();
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Действия — пунктами меню, а не буквами: буквы в этой колонке заняты фильтром,
+     * а случайная буква на проде стоит развёртывания.
+     */
+    openContainerMenu(row) {
+        const items =
+            row.service === null
+                ? [
+                      { label: 'Обновить всё (pull + up -d)', value: 'update-all' },
+                      { label: 'Логи всего проекта', value: 'logs-all' },
+                  ]
+                : [
+                      { label: 'Логи', value: 'logs' },
+                      { label: 'Обновить (pull + up -d)', value: 'update' },
+                      { label: 'Образы и откат', value: 'images' },
+                      { label: 'Рестарт', value: 'restart' },
+                      { label: 'Стоп', value: 'stop' },
+                  ];
+        this.app.push(
+            new MenuView(this.app, {
+                title: row.service ?? 'весь проект',
+                hint: '↑↓ выбор  Enter выполнить  Backspace назад',
+                items,
+                onPick: (action) => {
+                    this.app.pop();
+                    this.app.composeAction({ action, service: row.service });
+                },
+            })
         );
     }
 
@@ -2143,6 +2309,8 @@ class HomeView extends View {
         const context = this.rightContext();
         if (context === 'services') {
             this.renderServices();
+        } else if (context === 'containers') {
+            this.renderContainers();
         } else if (context === 'jobs') {
             this.renderJobs();
         } else if (context === 'trace') {
@@ -2335,6 +2503,11 @@ class HomeView extends View {
                 return true;
             }
         }
+        if (this.focus === 'right' && this.rightContext() === 'containers') {
+            if (this.handleContainersKey(chunk, key)) {
+                return true;
+            }
+        }
         if (this.focus === 'right' && this.rightContext() === 'jobs') {
             if (this.handleJobsKey(chunk, key)) {
                 return true;
@@ -2497,6 +2670,7 @@ class HomeView extends View {
         }
         if (name === 'r') {
             this.app.index.refresh();
+            void this.app.compose?.refresh();
             this.model.rebuild();
             this.syncServices();
             const pipeline = this.selectedPipeline();
@@ -2621,6 +2795,9 @@ class HomeView extends View {
         if (this.focus === 'right' && context === 'services') {
             return 'печатай фильтр  ↑↓ сервис  Пробел режим  Enter запуск  Tab/←/Esc назад  Ctrl+C выход';
         }
+        if (this.focus === 'right' && context === 'containers') {
+            return 'печатай фильтр  ↑↓ контейнер  Enter действия  Tab/←/Esc назад  Ctrl+C выход';
+        }
         if (this.focus === 'right' && context === 'jobs') {
             return '↑↓ джоба  Enter трасса  ←/Esc назад  r обновить  q выход';
         }
@@ -2628,6 +2805,109 @@ class HomeView extends View {
             return '↑↓ PgUp/PgDn скролл  / поиск  y копировать  z на весь экран  t время  ←/Esc назад';
         }
         return 'Tab/←→ колонки  Enter выбрать  Пробел режим  y копировать  z весь экран  p пайплайн  s стоп  S стоп все  d забыть  i детали  t время  / поиск  r обновить  ? помощь  q выход';
+    }
+}
+
+/**
+ * Список поверх экрана: меню действий и каталог образов. Именно вид, а не колонка —
+ * это разовый выбор, а не постоянное содержимое. Буквенных хоткеев внутри нет:
+ * при filterable они уходят в фильтр, иначе игнорируются.
+ */
+class MenuView extends View {
+    constructor(app, { title, items, onPick, hint = '', filterable = false }) {
+        super(app);
+        this.title = title;
+        this.items = items;
+        this.onPick = onPick;
+        this.hint = hint;
+        this.filterable = filterable;
+        this.filter = '';
+        this.cursor = 0;
+    }
+
+    mount() {
+        this.box = this.app.blessed.box({
+            parent: this.app.body,
+            top: 'center',
+            left: 'center',
+            width: '80%',
+            height: '80%',
+            border: 'line',
+            label: ` ${this.title} `,
+            tags: true,
+            scrollable: true,
+            alwaysScroll: true,
+            padding: { left: 1, right: 1 },
+        });
+        this.widgets = [this.box];
+        this.render();
+    }
+
+    visible() {
+        if (!this.filterable || !this.filter) {
+            return this.items;
+        }
+        const needle = this.filter.toLowerCase();
+        return this.items.filter((item) => item.label.toLowerCase().includes(needle));
+    }
+
+    render() {
+        const rows = this.visible();
+        this.cursor = Math.min(this.cursor, Math.max(0, rows.length - 1));
+        const head = this.filterable
+            ? `Фильтр: ${this.filter || '{grey-fg}(пусто){/}'}\n\n`
+            : '';
+        const body =
+            rows.length === 0
+                ? '{grey-fg}Ничего не найдено.{/}'
+                : rows
+                      .map((item, position) =>
+                          position === this.cursor
+                              ? `{inverse}${stripTags(item.label)}{/}`
+                              : item.label
+                      )
+                      .join('\n');
+        this.box.setContent(`${head}${body}`);
+        this.box.scrollTo(this.cursor);
+    }
+
+    handleKey(chunk, key) {
+        const name = key?.name;
+        if (name === 'up' || name === 'down') {
+            const limit = this.visible().length - 1;
+            this.cursor = Math.max(0, Math.min(limit, this.cursor + (name === 'down' ? 1 : -1)));
+            this.render();
+            return true;
+        }
+        if (CONFIRM_KEYS.has(name)) {
+            const picked = this.visible()[this.cursor];
+            if (picked) {
+                this.onPick(picked.value);
+            }
+            return true;
+        }
+        if (name === 'backspace' && this.filterable && this.filter.length > 0) {
+            this.filter = this.filter.slice(0, -1);
+            this.render();
+            return true;
+        }
+        if (
+            this.filterable &&
+            !key?.ctrl &&
+            !key?.meta &&
+            typeof chunk === 'string' &&
+            chunk.length === 1 &&
+            chunk >= ' '
+        ) {
+            this.filter += chunk;
+            this.render();
+            return true;
+        }
+        return false;
+    }
+
+    hotkeys() {
+        return this.hint || '↑↓ выбор  Enter выполнить  Backspace назад';
     }
 }
 
@@ -2712,6 +2992,12 @@ class HelpView extends View {
                 'r            пересканировать воркспейсы',
                 'Backspace    назад',
                 'q / Ctrl+C   выход',
+                '',
+                'Docker Compose:',
+                '  Enter на контейнере — меню: логи, обновить, образы и откат, рестарт, стоп',
+                '  первая строка списка — операции над всем проектом',
+                '  буквы фильтруют список, всё меняющее состояние спрашивает подтверждение',
+
             ].join('\n')
         );
     }
@@ -2770,6 +3056,8 @@ class TuiApp {
         pipelines = null,
         roots = null,
         clipboardImpl = null,
+        compose = null,
+        imageCatalogImpl = null,
     }) {
         this.clipboard = clipboardImpl ?? ((text) => copyToClipboard(text));
         this.notice = null;
@@ -2780,6 +3068,13 @@ class TuiApp {
         this.index.refresh();
         this.manager = new TaskManager({ repoRoot });
         this.pipelines = pipelines ?? createPipelineStore({ repoRoot });
+        this.compose = compose ?? createComposeStore({ startDir: repoRoot });
+        // Каталог нужен только при живом compose; реестр подставляется на вызов.
+        this.imageCatalog =
+            imageCatalogImpl ??
+            (this.compose.isEnabled()
+                ? new ImageCatalog({ cli: this.compose.cli, runner: this.compose.runner })
+                : null);
         this.screen = null;
         this.stack = null;
         this.timer = null;
@@ -2809,6 +3104,14 @@ class TuiApp {
         this.stack = new NavigationStack(new HomeView(this));
         this.stack.top().mount();
         this.manager.on('changed', () => this.renderStatus());
+        this.compose.on('changed', () => {
+            const view = this.stack.top();
+            if (view instanceof HomeView) {
+                view.model.rebuild();
+                view.render();
+            }
+            this.render();
+        });
         this.pipelines.on('changed', () => {
             const view = this.stack.top();
             if (view instanceof HomeView) {
@@ -2820,20 +3123,29 @@ class TuiApp {
         this.screen.on('resize', () => this.render());
         this.screen.on('keypress', (chunk, key) => this.onKey(chunk, key));
         this.ticks = 0;
-        this.timer = setInterval(() => {
-            this.stack.top().tick();
-            this.renderStatus();
-            this.screen.render();
-            // Пайплайны опрашиваем раз в 30 с и только пока что-то бежит.
-            this.ticks += 1;
-            if (this.ticks % Math.max(1, Math.round(30_000 / this.tickMs)) === 0) {
-                if (this.pipelines.hasRunning()) {
-                    void this.pipelines.refresh();
-                }
-            }
-        }, this.tickMs);
+        this.timer = setInterval(() => this.onTick(), this.tickMs);
         void this.pipelines.refresh();
+        void this.compose.refresh();
         this.render();
+    }
+
+    onTick() {
+        this.stack.top().tick();
+        this.renderStatus();
+        this.screen.render();
+        this.ticks += 1;
+        const every = (ms) => Math.max(1, Math.round(ms / this.tickMs));
+        // Пайплайны — раз в 30 с и только пока что-то бежит.
+        if (this.ticks % every(30_000) === 0 && this.pipelines.hasRunning()) {
+            void this.pipelines.refresh();
+        }
+        // Контейнеры — раз в 5 с и только пока курсор стоит на секции compose.
+        if (this.ticks % every(5000) === 0 && this.compose.isEnabled()) {
+            const view = this.stack.top();
+            if (view instanceof HomeView && view.model.selected()?.kind === 'compose') {
+                void this.compose.refresh();
+            }
+        }
     }
 
     push(view) {
@@ -2929,6 +3241,181 @@ class TuiApp {
         if (name === 'q' || (key?.ctrl && name === 'c')) {
             this.requestQuit();
         }
+    }
+
+    /** Общий диалог: показываем ровно те команды, которые уйдут в docker. */
+    confirmCommands({ title, targets, note = '', onConfirm }) {
+        const commands = targets
+            .map((target) => `${target.command} ${target.args.join(' ')}`)
+            .join('\n');
+        this.push(
+            new ConfirmView(this, {
+                title,
+                text: note ? `${commands}\n\n${note}` : commands,
+                onConfirm: () => {
+                    this.pop();
+                    onConfirm();
+                },
+            })
+        );
+    }
+
+    composeAction({ action, service }) {
+        const store = this.compose;
+        if (!store?.isEnabled()) {
+            return;
+        }
+        const cli = store.cli;
+
+        if (action === 'logs') {
+            this.manager.startDocker({
+                label: `logs ${service}`,
+                target: cli.logs(service),
+                service,
+            });
+            return;
+        }
+        if (action === 'logs-all') {
+            this.manager.startDocker({ label: 'logs всего проекта', target: cli.logsAll() });
+            return;
+        }
+        if (action === 'images') {
+            void this.openImageCatalog(service);
+            return;
+        }
+        if (action === 'update') {
+            const targets = [cli.pull(service), cli.up(service)];
+            this.confirmCommands({
+                title: `Обновить ${service}`,
+                targets,
+                onConfirm: () => {
+                    const task = this.manager.startSequence({
+                        label: `обновить ${service}`,
+                        targets,
+                        workspace: service,
+                    });
+                    task.once('status', () => {
+                        store.unpin(service);
+                        void store.refresh();
+                    });
+                },
+            });
+            return;
+        }
+        if (action === 'update-all') {
+            const targets = [cli.pullAll(), cli.upAll()];
+            this.confirmCommands({
+                title: `Обновить ${store.project.name}`,
+                targets,
+                note: `Затронет ${store.counters().total} сервисов.`,
+                onConfirm: () => {
+                    const task = this.manager.startSequence({
+                        label: `обновить ${store.project.name}`,
+                        targets,
+                    });
+                    task.once('status', () => void store.refresh());
+                },
+            });
+            return;
+        }
+        if (action === 'restart' || action === 'stop') {
+            const target = action === 'restart' ? cli.restart(service) : cli.stop(service);
+            this.confirmCommands({
+                title: `${action === 'restart' ? 'Рестарт' : 'Стоп'} ${service}`,
+                targets: [target],
+                onConfirm: () => {
+                    const task = this.manager.startDocker({
+                        label: `${action} ${service}`,
+                        target,
+                        service,
+                    });
+                    task.once('status', () => void store.refresh());
+                },
+            });
+        }
+    }
+
+    async openImageCatalog(service) {
+        const store = this.compose;
+        const container = store.containers().find((item) => item.service === service);
+        const reference = imageReferenceForService(container);
+        if (!reference) {
+            this.notify(`У ${service} не разобрать образ — откат недоступен.`);
+            return;
+        }
+        this.notify(`Собираю список образов ${reference.repo}…`);
+        // Реестр зависит от репозитория конкретного сервиса, поэтому мостик
+        // создаётся здесь, на клиенте GitLab от секции пайплайнов. Нет токена —
+        // нет реестра, и это не мешает: локальные образы уже дают откат.
+        const registry = this.pipelines?.client
+            ? new RegistryLookup({ client: this.pipelines.client, repo: reference.repo })
+            : null;
+        const { items, registryReason } = await this.imageCatalog.build({
+            repo: reference.repo,
+            tag: reference.tag,
+            container: container.name,
+            registry,
+        });
+        if (items.length === 0) {
+            this.notify(`Образов не нашлось${registryReason ? `: ${registryReason}` : ''}.`);
+            return;
+        }
+        this.notice = registryReason ? `Реестр недоступен: ${registryReason}` : null;
+        this.push(
+            new MenuView(this, {
+                title: `Образы ${service}`,
+                hint: 'печатай фильтр  ↑↓ выбор  Enter откатить  Backspace назад',
+                filterable: true,
+                items: items.map((item) => ({
+                    label: [
+                        item.isCurrent ? '●' : ' ',
+                        item.digest.slice(0, 19),
+                        item.sources.includes('local') ? 'локально' : 'реестр',
+                        item.createdAt ? item.createdAt.toLocaleString() : 'дата неизвестна',
+                        item.isCurrent ? '← запущен сейчас' : '',
+                    ]
+                        .filter((part) => part !== '')
+                        .join('  '),
+                    value: item,
+                })),
+                onPick: (item) => {
+                    this.pop();
+                    this.confirmRollback({ service, reference, item });
+                },
+            })
+        );
+    }
+
+    confirmRollback({ service, reference, item }) {
+        const store = this.compose;
+        const targets = rollbackTargets({
+            cli: store.cli,
+            repo: reference.repo,
+            tag: reference.tag,
+            digest: item.digest,
+            service,
+            alreadyLocal: item.sources.includes('local'),
+        });
+        this.confirmCommands({
+            title: `Откат ${service}`,
+            targets,
+            note: [
+                `Образ ${item.digest.slice(0, 19)} от ${
+                    item.createdAt ? item.createdAt.toLocaleString() : 'неизвестной даты'
+                }.`,
+                'После отката локальный тег разойдётся с реестром: следующее «Обновить»',
+                'осознанно уедет вперёд на свежий образ.',
+            ].join('\n'),
+            onConfirm: () => {
+                const task = this.manager.startSequence({
+                    label: `откат ${service}`,
+                    targets,
+                    workspace: service,
+                });
+                store.pin(service);
+                task.once('status', () => void store.refresh());
+            },
+        });
     }
 
     /** Запуск пайплайна — запись в GitLab, поэтому только через подтверждение. */
@@ -3031,6 +3518,7 @@ module.exports = {
     TaskDetailsView,
     HelpView,
     ConfirmView,
+    MenuView,
     TuiApp,
     assertTerminal,
     selfCheck,
