@@ -14,6 +14,325 @@ const MIN_ROWS = 24;
 const TICK_MS = 500;
 const SIDE_WIDTH = 34;
 
+const DEFAULT_LOG_TAIL = 200;
+
+/** Строит argv для docker. Только строит: исполняют DockerRunner или задачи. */
+class DockerCli {
+    constructor({ composeFile, dockerPath = 'docker' }) {
+        this.composeFile = composeFile;
+        this.dockerPath = dockerPath;
+    }
+
+    #target(args) {
+        return { command: this.dockerPath, args, shell: false };
+    }
+
+    #compose(args) {
+        return this.#target(['compose', '-f', this.composeFile, ...args]);
+    }
+
+    ps() {
+        return this.#compose(['ps', '--format', 'json']);
+    }
+
+    logs(service, { tail = DEFAULT_LOG_TAIL } = {}) {
+        return this.#compose(['logs', '-f', '--tail', String(tail), service]);
+    }
+
+    logsAll({ tail = DEFAULT_LOG_TAIL } = {}) {
+        return this.#compose(['logs', '-f', '--tail', String(tail)]);
+    }
+
+    pull(service) {
+        return this.#compose(['pull', service]);
+    }
+
+    pullAll() {
+        return this.#compose(['pull']);
+    }
+
+    up(service, { noDeps = false } = {}) {
+        const args = ['up', '-d'];
+        if (noDeps) {
+            args.push('--no-deps');
+        }
+        args.push(service);
+        return this.#compose(args);
+    }
+
+    upAll() {
+        return this.#compose(['up', '-d']);
+    }
+
+    restart(service) {
+        return this.#compose(['restart', service]);
+    }
+
+    stop(service) {
+        return this.#compose(['stop', service]);
+    }
+
+    images(repo) {
+        return this.#target(['images', '--digests', '--format', 'json', repo]);
+    }
+
+    inspectContainerImage(container) {
+        return this.#target(['inspect', '--format', '{{.Image}}', container]);
+    }
+
+    imageDigests(imageId) {
+        return this.#target(['image', 'inspect', '--format', '{{json .RepoDigests}}', imageId]);
+    }
+
+    pullImage(reference) {
+        return this.#target(['pull', reference]);
+    }
+
+    tag(source, target) {
+        return this.#target(['tag', source, target]);
+    }
+}
+
+/** Синхронный запуск читающих команд docker. Долгие идут через задачи. */
+class DockerRunner {
+    constructor({ spawnSyncImpl = spawnSync } = {}) {
+        this.spawnSyncImpl = spawnSyncImpl;
+    }
+
+    run(target) {
+        const result = this.spawnSyncImpl(target.command, target.args, {
+            encoding: 'utf8',
+            shell: false,
+            windowsHide: true,
+        });
+        if (!result || result.error) {
+            return { status: 127, stdout: '', stderr: result?.error?.message ?? 'spawn failed' };
+        }
+        return {
+            status: result.status ?? 1,
+            stdout: String(result.stdout ?? ''),
+            stderr: String(result.stderr ?? ''),
+        };
+    }
+}
+
+const COMPOSE_FILENAMES = ['docker-compose.yml', 'compose.yaml', 'docker-compose.yaml'];
+// Имя проекта — единственное, что нужно из compose-файла, поэтому берём его
+// регуляркой по строкам, а не тянем в зависимости парсер YAML. Ключ учитывается
+// только без отступа: "name:" внутри сервиса или в environment — не про проект.
+const COMPOSE_NAME_LINE = /^name:\s*["']?([^"'#\s]+)/;
+
+class ComposeProject {
+    constructor({ file, dir, name }) {
+        this.file = file;
+        this.dir = dir;
+        this.name = name;
+    }
+
+    static find(startDir, { fsImpl = fs } = {}) {
+        let dir = path.resolve(startDir);
+        for (;;) {
+            for (const filename of COMPOSE_FILENAMES) {
+                const candidate = path.join(dir, filename);
+                if (fsImpl.existsSync(candidate)) {
+                    return new ComposeProject({
+                        file: candidate,
+                        dir,
+                        name: ComposeProject.readName(candidate, { fsImpl }) ?? path.basename(dir),
+                    });
+                }
+            }
+            if (fsImpl.existsSync(path.join(dir, '.git'))) {
+                return null;
+            }
+            const parent = path.dirname(dir);
+            if (parent === dir) {
+                return null;
+            }
+            dir = parent;
+        }
+    }
+
+    static readName(file, { fsImpl = fs } = {}) {
+        try {
+            for (const line of fsImpl.readFileSync(file, 'utf8').split('\n')) {
+                const match = line.match(COMPOSE_NAME_LINE);
+                if (match) {
+                    return match[1];
+                }
+            }
+        } catch {
+            return null;
+        }
+        return null;
+    }
+}
+
+/**
+ * `docker compose ps --format json` в разных версиях отдаёт то построчный JSON,
+ * то массив, а поля пишет то с большой буквы, то с маленькой. Терпим оба вида,
+ * битые строки пропускаем.
+ */
+function parseJsonRecords(text) {
+    const source = String(text ?? '').trim();
+    if (!source) {
+        return [];
+    }
+    if (source.startsWith('[')) {
+        try {
+            const parsed = JSON.parse(source);
+            return Array.isArray(parsed) ? parsed : [];
+        } catch {
+            return [];
+        }
+    }
+    const records = [];
+    for (const line of source.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+            continue;
+        }
+        try {
+            records.push(JSON.parse(trimmed));
+        } catch {
+            // строка не JSON — пропускаем, остальные всё равно пригодны
+        }
+    }
+    return records;
+}
+
+function pickField(record, ...names) {
+    for (const name of names) {
+        if (record[name] !== undefined) {
+            return record[name];
+        }
+    }
+    return undefined;
+}
+
+function parsePsOutput(text) {
+    return parseJsonRecords(text).map((record) => ({
+        service: String(pickField(record, 'Service', 'service') ?? ''),
+        name: String(pickField(record, 'Name', 'name') ?? ''),
+        state: String(pickField(record, 'State', 'state') ?? ''),
+        status: String(pickField(record, 'Status', 'status') ?? ''),
+        image: String(pickField(record, 'Image', 'image') ?? ''),
+        exitCode: Number(pickField(record, 'ExitCode', 'exitCode') ?? 0),
+    }));
+}
+
+const DOCKER_DATE = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.\d+)?\s*([+-]\d{2}):?(\d{2})/;
+
+/**
+ * docker печатает дату как "2026-08-12 21:04:11 +0300 MSK" — с пробелом вместо T,
+ * смещением без двоеточия и названием зоны на хвосте. new Date() на такое отдаёт
+ * Invalid Date, поэтому приводим к ISO сами. ISO-строки (из реестра) проходят как есть.
+ */
+function parseDockerDate(value) {
+    const text = String(value ?? '').trim();
+    if (!text) {
+        return null;
+    }
+    const match = text.match(DOCKER_DATE);
+    const parsed = match
+        ? new Date(`${match[1]}T${match[2]}${match[3]}:${match[4]}`)
+        : new Date(text);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function parseImagesOutput(text) {
+    return parseJsonRecords(text)
+        .map((record) => {
+            const digest = String(pickField(record, 'Digest', 'digest') ?? '');
+            const tag = String(pickField(record, 'Tag', 'tag') ?? '');
+            const createdAt = parseDockerDate(pickField(record, 'CreatedAt', 'createdAt'));
+            return {
+                repository: String(pickField(record, 'Repository', 'repository') ?? ''),
+                tag: tag && tag !== '<none>' ? tag : null,
+                digest,
+                createdAt,
+                size: String(pickField(record, 'Size', 'size') ?? ''),
+                id: String(pickField(record, 'ID', 'Id', 'id') ?? ''),
+            };
+        })
+        .filter((image) => image.digest && image.digest !== '<none>');
+}
+
+/** Состояние контейнеров проекта. Только чтение: ничего не пишет и не спрашивает. */
+class ComposeStore extends EventEmitter {
+    constructor({ project = null, cli = null, runner = null, reason = '' }) {
+        super();
+        this.project = project;
+        this.cli = cli;
+        this.runner = runner;
+        this.status = project && cli && runner ? 'idle' : 'disabled';
+        this.reason = reason;
+        this.items = [];
+        this.pinned = new Set();
+    }
+
+    isEnabled() {
+        return this.status !== 'disabled';
+    }
+
+    containers() {
+        return this.items;
+    }
+
+    counters() {
+        const up = this.items.filter((container) => container.state === 'running').length;
+        return { up, total: this.items.length };
+    }
+
+    hasRunning() {
+        return this.items.some((container) => container.state === 'running');
+    }
+
+    pin(service) {
+        this.pinned.add(service);
+        this.emit('changed');
+    }
+
+    unpin(service) {
+        this.pinned.delete(service);
+        this.emit('changed');
+    }
+
+    isPinned(service) {
+        return this.pinned.has(service);
+    }
+
+    async refresh() {
+        if (!this.isEnabled() || this.status === 'loading') {
+            return;
+        }
+        this.status = 'loading';
+        this.emit('changed');
+        const result = this.runner.run(this.cli.ps());
+        if (result.status !== 0) {
+            this.status = 'error';
+            this.reason = (result.stderr || 'docker вернул ошибку').trim();
+        } else {
+            this.items = parsePsOutput(result.stdout);
+            this.status = 'ready';
+            this.reason = '';
+        }
+        this.emit('changed');
+    }
+}
+
+function createComposeStore({ startDir, fsImpl = fs, spawnSyncImpl = spawnSync } = {}) {
+    const project = ComposeProject.find(startDir, { fsImpl });
+    if (!project) {
+        return new ComposeStore({ reason: 'Рядом нет compose-файла.' });
+    }
+    return new ComposeStore({
+        project,
+        cli: new DockerCli({ composeFile: project.file }),
+        runner: new DockerRunner({ spawnSyncImpl }),
+    });
+}
+
 function readJsonFile(filePath, fsImpl = fs) {
     try {
         const parsed = JSON.parse(fsImpl.readFileSync(filePath, 'utf8'));
@@ -2408,6 +2727,15 @@ class TuiApp {
 }
 
 module.exports = {
+    DockerCli,
+    DockerRunner,
+    ComposeProject,
+    COMPOSE_FILENAMES,
+    parsePsOutput,
+    parseImagesOutput,
+    parseDockerDate,
+    ComposeStore,
+    createComposeStore,
     WorkspaceIndex,
     NpmCommand,
     AnsiTags,
