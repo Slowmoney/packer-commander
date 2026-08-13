@@ -1875,20 +1875,24 @@ class SidePanelModel {
         const done = tasks.filter((task) => task.status !== 'running');
         const rows = [];
 
-        rows.push({
-            kind: 'header',
-            key: 'header:commands',
-            label: '▶ Команды',
-            selectable: false,
-        });
-        for (const command of this.index.commands()) {
+        // Пустой заголовок — мусор: в каталоге вроде /opt npm-воркспейсов нет вовсе.
+        const commands = this.index.commands();
+        if (commands.length > 0) {
             rows.push({
-                kind: 'command',
-                key: `command:${command}`,
-                label: `  ${command}`,
-                selectable: true,
-                command,
+                kind: 'header',
+                key: 'header:commands',
+                label: '▶ Команды',
+                selectable: false,
             });
+            for (const command of commands) {
+                rows.push({
+                    kind: 'command',
+                    key: `command:${command}`,
+                    label: `  ${command}`,
+                    selectable: true,
+                    command,
+                });
+            }
         }
         rows.push({
             kind: 'header',
@@ -1955,7 +1959,8 @@ class SidePanelModel {
 
     #pushPipelineRows(rows) {
         const store = this.pipelines;
-        if (!store) {
+        // Секция без токена и без git-remote бесполезна: там нечего показать.
+        if (!store?.isEnabled()) {
             return;
         }
         const ref = store.ref ? ` ${store.ref}` : '';

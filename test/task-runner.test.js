@@ -642,6 +642,38 @@ test('SidePanelModel уходит в начало только когда поз
     assert.equal(model.selected().key, 'command:build');
 });
 
+test('SidePanelModel не рисует пустые секции команд и выключенных пайплайнов', () => {
+    const root = makeRepo({ 'apps/empty': { name: '@ssmm/empty', scripts: {} } });
+    const index = new WorkspaceIndex({ repoRoot: root });
+    index.refresh();
+    const { manager } = makeManager();
+    const model = new SidePanelModel({
+        index,
+        manager,
+        // Выключенное хранилище — ровно то, что бывает без токена и без git-remote.
+        pipelines: new PipelineStore({ reason: 'нет токена' }),
+    });
+
+    model.rebuild();
+    const labels = model.rows().map((row) => row.label);
+
+    assert.equal(
+        labels.some((label) => label.includes('Команды')),
+        false,
+        'нет ни одного скрипта — нет заголовка'
+    );
+    assert.equal(
+        labels.some((label) => label.includes('Пайплайны')),
+        false,
+        'GitLab выключен — секции нет'
+    );
+    assert.equal(
+        labels.some((label) => label.includes('Запущено')),
+        true,
+        'задачи показываются всегда'
+    );
+});
+
 test('NavigationStack возвращает предыдущий вид и не уходит ниже корня', () => {
     const stack = new NavigationStack('home');
     assert.equal(stack.depth, 1);

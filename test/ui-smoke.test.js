@@ -954,6 +954,30 @@ test('состояние проекта помнится: фильтр и выб
     }
 });
 
+test('задачи остаются на месте рядом с секцией проектов', async () => {
+    const { app, home, cleanup } = await optHome();
+    try {
+        const project = home.selectedProject();
+        app.manager.startCommand({
+            command: 'sh up-all.sh',
+            workspace: project.name,
+            runMode: 'default',
+            label: () => 'sh up-all.sh',
+            args: () => [],
+            spawnTarget: () => ({ command: 'bash', args: ['up-all.sh'], cwd: project.dir }),
+        });
+        home.model.rebuild();
+        home.render();
+
+        assert.match(home.side.content, /Запущено \(1\)/, 'живая задача видна');
+        assert.match(home.side.content, /up-all\.sh/);
+        assert.match(home.side.content, /Завершено \(0\)/, 'секция завершённых на месте');
+        assert.match(home.side.content, /Проекты \(1\)/, 'и проекты рядом');
+    } finally {
+        cleanup();
+    }
+});
+
 test('при секции проектов отдельной секции Compose нет', async () => {
     const { home, cleanup } = await optHome();
     try {
