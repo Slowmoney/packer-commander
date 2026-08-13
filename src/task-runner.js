@@ -168,6 +168,209 @@ class ComposeProject {
     }
 }
 
+const MAKEFILE_NAMES = ['makefile', 'Makefile', 'GNUmakefile'];
+const SKIPPED_DIRS = new Set(['node_modules', 'dist', 'coverage', 'tmp']);
+
+/**
+ * Каталог проектов: сам корень плюс папки на один уровень вниз, в которых есть
+ * хоть что-то запускаемое. Один уровень — сознательно: рекурсия по /opt уперлась
+ * бы в тома docker, логи и node_modules.
+ */
+class ProjectIndex {
+    constructor({ root, fsImpl = fs }) {
+        this.root = path.resolve(root);
+        this.fs = fsImpl;
+        this.items = [];
+        this.reason = '';
+    }
+
+    refresh() {
+        const found = [];
+        const rootProject = this.#describe(this.root, true);
+        if (rootProject) {
+            found.push(rootProject);
+        }
+        for (const entry of this.#readDir(this.root)) {
+            if (
+                !entry.isDirectory() ||
+                entry.name.startsWith('.') ||
+                SKIPPED_DIRS.has(entry.name)
+            ) {
+                continue;
+            }
+            const project = this.#describe(path.join(this.root, entry.name), false);
+            if (project) {
+                found.push(project);
+            }
+        }
+        const children = found.filter((project) => !project.isRoot);
+        this.items = [
+            ...found.filter((project) => project.isRoot),
+            ...children.sort((a, b) => a.name.localeCompare(b.name)),
+        ];
+        this.reason = children.length === 0 ? 'Рядом не нашлось проектов с запускаемым.' : '';
+    }
+
+    projects() {
+        return this.items;
+    }
+
+    get(dir) {
+        return this.items.find((project) => project.dir === dir) ?? null;
+    }
+
+    hasChildren() {
+        return this.items.some((project) => !project.isRoot);
+    }
+
+    #readDir(dir) {
+        try {
+            return this.fs.readdirSync(dir, { withFileTypes: true });
+        } catch {
+            return [];
+        }
+    }
+
+    #describe(dir, isRoot) {
+        const entries = this.#readDir(dir);
+        const files = new Set(entries.filter((entry) => !entry.isDirectory()).map((e) => e.name));
+        const composeName = COMPOSE_FILENAMES.find((name) => files.has(name)) ?? null;
+        const makefileName = MAKEFILE_NAMES.find((name) => files.has(name)) ?? null;
+        const scripts = [...files]
+            .filter((name) => name.endsWith('.sh'))
+            .sort((a, b) => a.localeCompare(b))
+            .map((name) => path.join(dir, name));
+        const pkg = files.has('package.json')
+            ? readJsonFile(path.join(dir, 'package.json'), this.fs)
+            : null;
+        const hasPackageJson = Boolean(pkg && Object.keys(pkg.scripts ?? {}).length > 0);
+
+        if (!composeName && !makefileName && scripts.length === 0 && !hasPackageJson) {
+            return null;
+        }
+        return {
+            name: isRoot ? `${path.basename(dir)} (корень)` : path.basename(dir),
+            dir,
+            composeFile: composeName ? path.join(dir, composeName) : null,
+            makefile: makefileName ? path.join(dir, makefileName) : null,
+            scripts,
+            hasPackageJson,
+            isRoot,
+        };
+    }
+}
+
+// Цель — строка без отступа вида "name:" или "name:: deps". Отсекаем шаблонные
+// правила с %, служебные цели с точки и присваивания переменных: ":=", "?=", "+=".
+const MAKE_TARGET_LINE = /^([A-Za-z0-9_.\-/]+)\s*::?(?!=)/;
+
+class MakefileTargets {
+    static parse(text) {
+        const targets = [];
+        for (const line of String(text ?? '').split('\n')) {
+            if (!line || line.startsWith('\t') || line.startsWith(' ') || line.startsWith('#')) {
+                continue;
+            }
+            const match = line.match(MAKE_TARGET_LINE);
+            if (!match) {
+                continue;
+            }
+            const name = match[1];
+            if (name.startsWith('.') || name.includes('%')) {
+                continue;
+            }
+            if (!targets.includes(name)) {
+                targets.push(name);
+            }
+        }
+        return targets;
+    }
+}
+
+/** Цель make как спека задачи. */
+class MakeCommand {
+    constructor({ target, dir, projectName }) {
+        this.target = target;
+        this.dir = dir;
+        this.projectName = projectName;
+        this.workspace = projectName;
+        this.command = `make ${target}`;
+        this.runMode = 'default';
+    }
+
+    label() {
+        return `make ${this.target} (${this.projectName})`;
+    }
+
+    args() {
+        return ['-C', this.dir, this.target];
+    }
+
+    spawnTarget() {
+        return { command: 'make', args: this.args(), shell: false, cwd: this.dir };
+    }
+}
+
+/**
+ * Shell-скрипт как спека задачи. Запускаем через bash, а не сам файл: бита +x
+ * может не быть, а sh не понимает bash-измов, которые в таких скриптах обычны.
+ */
+class ShellCommand {
+    constructor({ script, dir, projectName, shellPath = 'bash' }) {
+        this.script = script;
+        this.dir = dir;
+        this.projectName = projectName;
+        this.shellPath = shellPath;
+        this.workspace = projectName;
+        this.command = `sh ${path.basename(script)}`;
+        this.runMode = 'default';
+    }
+
+    label() {
+        return `sh ${path.basename(this.script)} (${this.projectName})`;
+    }
+
+    args() {
+        return [this.script];
+    }
+
+    spawnTarget() {
+        return { command: this.shellPath, args: this.args(), shell: false, cwd: this.dir };
+    }
+}
+
+/**
+ * Плоский список запускаемого проекта, отсортированный по типу. Плоский — потому
+ * что при 35 проектах главная операция «быстро найти», а её даёт фильтр по всему
+ * списку, а не подменю по категориям.
+ */
+function projectRunnables(
+    project,
+    { composeStore = null, makefileText = null, packageScripts = [] } = {}
+) {
+    const rows = [];
+    if (project.composeFile) {
+        const counters = composeStore?.isEnabled() ? composeStore.counters() : null;
+        const suffix = counters ? ` ${counters.up}/${counters.total}` : '';
+        rows.push({ kind: 'containers', key: 'containers', label: `▸    контейнеры${suffix}` });
+    }
+    for (const target of MakefileTargets.parse(makefileText)) {
+        rows.push({ kind: 'make', key: `make:${target}`, label: `make ${target}`, target });
+    }
+    for (const script of project.scripts) {
+        rows.push({
+            kind: 'sh',
+            key: `sh:${script}`,
+            label: `sh   ${path.basename(script)}`,
+            script,
+        });
+    }
+    for (const command of packageScripts) {
+        rows.push({ kind: 'npm', key: `npm:${command}`, label: `npm  ${command}`, command });
+    }
+    return rows;
+}
+
 /**
  * `docker compose ps --format json` в разных версиях отдаёт то построчный JSON,
  * то массив, а поля пишет то с большой буквы, то с маленькой. Терпим оба вида,
@@ -318,6 +521,47 @@ class ComposeStore extends EventEmitter {
             this.reason = '';
         }
         this.emit('changed');
+    }
+}
+
+/**
+ * Хранилища контейнеров по проектам. Создаются лениво: 35 проектов не должны
+ * превратиться в 35 опросов docker при старте.
+ */
+class ComposeRegistry extends EventEmitter {
+    constructor({ fsImpl = fs, spawnSyncImpl = spawnSync } = {}) {
+        super();
+        this.fs = fsImpl;
+        this.spawnSyncImpl = spawnSyncImpl;
+        this.byDir = new Map();
+    }
+
+    forProject(project) {
+        if (!project?.composeFile) {
+            return null;
+        }
+        const existing = this.byDir.get(project.dir);
+        if (existing) {
+            return existing;
+        }
+        const store = new ComposeStore({
+            project: new ComposeProject({
+                file: project.composeFile,
+                dir: project.dir,
+                name:
+                    ComposeProject.readName(project.composeFile, { fsImpl: this.fs }) ??
+                    project.name,
+            }),
+            cli: new DockerCli({ composeFile: project.composeFile }),
+            runner: new DockerRunner({ spawnSyncImpl: this.spawnSyncImpl }),
+        });
+        store.on('changed', () => this.emit('changed'));
+        this.byDir.set(project.dir, store);
+        return store;
+    }
+
+    known() {
+        return [...this.byDir.values()];
     }
 }
 
@@ -1417,7 +1661,7 @@ class TaskManager extends EventEmitter {
     /** Опции спавна живут в одном месте: их легко нарушить по-разному в трёх копиях. */
     #spawn(target) {
         return this.spawnImpl(target.command, target.args, {
-            cwd: this.repoRoot,
+            cwd: target.cwd ?? this.repoRoot,
             // На POSIX процесс становится лидером своей группы — только так стоп
             // сможет прибить и npm, и его детей (node/nest/vite держат порт).
             // На Windows группы нет, там дерево снимает taskkill /T.
@@ -1442,12 +1686,27 @@ class TaskManager extends EventEmitter {
         return this.#register(task);
     }
 
+    /** Общий запуск любой спеки команды: npm, docker, make, shell. */
+    startCommand(spec) {
+        const task = new Task({ id: this.idFactory(), spec, ...this.taskOptions });
+        task.attach(this.#spawn(spec.spawnTarget()));
+        return this.#register(task);
+    }
+
     /** Одна команда docker как задача: логи, рестарт, стоп. */
     startDocker({ label, target, service = null }) {
-        const spec = new DockerCommand({ label, target, service });
-        const task = new Task({ id: this.idFactory(), spec, ...this.taskOptions });
-        task.attach(this.#spawn(target));
-        return this.#register(task);
+        return this.startCommand(new DockerCommand({ label, target, service }));
+    }
+
+    /** Запуск с настоящим терминалом: для интерактивных скриптов. */
+    runTargetForeground(target) {
+        const result = this.spawnSyncImpl(target.command, target.args, {
+            cwd: target.cwd ?? this.repoRoot,
+            stdio: 'inherit',
+            shell: target.shell === true,
+            windowsHide: true,
+        });
+        return result.status ?? 1;
     }
 
     /**
@@ -3490,6 +3749,13 @@ module.exports = {
     parseDockerDate,
     ComposeStore,
     createComposeStore,
+    ComposeRegistry,
+    ProjectIndex,
+    MAKEFILE_NAMES,
+    MakefileTargets,
+    MakeCommand,
+    ShellCommand,
+    projectRunnables,
     DockerCommand,
     CommandSequence,
     RegistryLookup,
