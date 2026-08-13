@@ -371,6 +371,34 @@ function projectRunnables(
     return rows;
 }
 
+/** Спека команды по строке списка запускаемого. */
+function specForRunnable({ project, row, platform = process.platform }) {
+    if (row.kind === 'make') {
+        return new MakeCommand({ target: row.target, dir: project.dir, projectName: project.name });
+    }
+    if (row.kind === 'sh') {
+        return new ShellCommand({
+            script: row.script,
+            dir: project.dir,
+            projectName: project.name,
+        });
+    }
+    if (row.kind === 'npm') {
+        // Проект чужой: запускаем в его папке и без --workspace.
+        const npm = new NpmCommand({ command: row.command, workspace: '.', platform });
+        const target = npm.spawnTarget();
+        return {
+            command: `npm ${row.command}`,
+            workspace: project.name,
+            runMode: 'default',
+            label: () => `npm ${row.command} (${project.name})`,
+            args: () => npm.args(),
+            spawnTarget: () => ({ ...target, cwd: project.dir }),
+        };
+    }
+    return null;
+}
+
 /**
  * `docker compose ps --format json` в разных версиях отдаёт то построчный JSON,
  * то массив, а поля пишет то с большой буквы, то с маленькой. Терпим оба вида,
@@ -1830,11 +1858,12 @@ function taskTail(task) {
 
 /** Плоский список строк левой панели: команды, живые задачи, завершённые. */
 class SidePanelModel {
-    constructor({ index, manager, pipelines = null, compose = null }) {
+    constructor({ index, manager, pipelines = null, compose = null, projects = null }) {
         this.index = index;
         this.manager = manager;
         this.pipelines = pipelines;
         this.compose = compose;
+        this.projects = projects;
         this.items = [];
         this.cursor = 0;
         this.cursorKey = null;
@@ -1880,6 +1909,7 @@ class SidePanelModel {
             rows.push(this.#taskRow(task));
         }
         this.#pushPipelineRows(rows);
+        this.#pushProjectRows(rows);
         this.#pushComposeRows(rows);
 
         this.items = rows;
@@ -1946,9 +1976,34 @@ class SidePanelModel {
         }
     }
 
+    #pushProjectRows(rows) {
+        const index = this.projects;
+        if (!index?.hasChildren()) {
+            return;
+        }
+        const projects = index.projects();
+        rows.push({
+            kind: 'header',
+            key: 'header:projects',
+            label: `📦 Проекты (${projects.filter((project) => !project.isRoot).length})`,
+            selectable: false,
+        });
+        for (const project of projects) {
+            rows.push({
+                kind: 'project',
+                key: `project:${project.dir}`,
+                label: `  ${project.name}`,
+                selectable: true,
+                project,
+            });
+        }
+    }
+
     #pushComposeRows(rows) {
         const store = this.compose;
-        if (!store?.isEnabled()) {
+        // Когда есть секция проектов, корень уже в ней первой строкой: две секции
+        // про один compose означали бы два пути с раздельным состоянием.
+        if (this.projects?.hasChildren() || !store?.isEnabled()) {
             return;
         }
         const { up, total } = store.counters();
@@ -2131,6 +2186,7 @@ class HomeView extends View {
             manager: app.manager,
             pipelines: app.pipelines,
             compose: app.compose,
+            projects: app.projects,
         });
         this.focus = 'side';
         // Показ таймстемпов — глобальная настройка отображения, а не свойство пункта.
@@ -2218,6 +2274,8 @@ class HomeView extends View {
             // указывать на чужую строку.
             services: { command: null, items: [], selectedRel: null, filter: '' },
             containers: { filter: '', selectedService: null },
+            runnables: { filter: '', selectedKey: null },
+            runnablesContext: 'runnables',
             jobs: { pipelineId: null, selectedJobId: null },
             trace: { jobId: null, buffer: null },
             search: { active: false, pattern: '', matches: [], position: 0 },
@@ -2250,6 +2308,8 @@ class HomeView extends View {
         }
         this.services = state.services;
         this.containers = state.containers;
+        this.runnables = state.runnables;
+        this.runnablesContext = state.runnablesContext;
         this.jobs = state.jobs;
         this.trace = state.trace;
         this.search = state.search;
@@ -2268,6 +2328,8 @@ class HomeView extends View {
         }
         state.services = this.services;
         state.containers = this.containers;
+        state.runnables = this.runnables;
+        state.runnablesContext = this.runnablesContext;
         state.jobs = this.jobs;
         state.trace = this.trace;
         state.search = this.search;
@@ -2302,6 +2364,9 @@ class HomeView extends View {
         }
         if (kind === 'compose') {
             return 'containers';
+        }
+        if (kind === 'project') {
+            return this.runnablesContext;
         }
         if (kind === 'pipeline') {
             return 'jobs';
@@ -2362,12 +2427,156 @@ class HomeView extends View {
         );
     }
 
+    selectedProject() {
+        const row = this.model.selected();
+        return row?.kind === 'project' ? row.project : null;
+    }
+
+    projectComposeStore() {
+        const project = this.selectedProject();
+        return project ? this.app.composeRegistry.forProject(project) : null;
+    }
+
+    /**
+     * Контейнеры показываются либо для выбранного проекта, либо для одиночного
+     * compose рядом с раннером — смотря откуда пришёл курсор.
+     */
+    activeComposeStore() {
+        return this.projectComposeStore() ?? this.app.compose;
+    }
+
+    allRunnables() {
+        const project = this.selectedProject();
+        if (!project) {
+            return [];
+        }
+        return projectRunnables(project, {
+            composeStore: this.projectComposeStore(),
+            makefileText: project.makefile ? this.app.readTextFile(project.makefile) : null,
+            packageScripts: project.hasPackageJson
+                ? Object.keys(
+                      readJsonFile(path.join(project.dir, 'package.json'))?.scripts ?? {}
+                  ).sort((a, b) => a.localeCompare(b))
+                : [],
+        });
+    }
+
+    visibleRunnables() {
+        const needle = this.runnables.filter.toLowerCase();
+        return this.allRunnables().filter((row) => row.label.toLowerCase().includes(needle));
+    }
+
+    runnableCursor() {
+        const rows = this.visibleRunnables();
+        const found = rows.findIndex((row) => row.key === this.runnables.selectedKey);
+        return found >= 0 ? found : 0;
+    }
+
+    selectedRunnable() {
+        return this.visibleRunnables()[this.runnableCursor()] ?? null;
+    }
+
+    moveRunnableCursor(delta) {
+        const rows = this.visibleRunnables();
+        if (rows.length === 0) {
+            return;
+        }
+        const next = Math.max(0, Math.min(rows.length - 1, this.runnableCursor() + delta));
+        this.runnables.selectedKey = rows[next].key;
+    }
+
+    renderRunnables() {
+        const project = this.selectedProject();
+        const rows = this.visibleRunnables();
+        const cursor = this.runnableCursor();
+        const filter = this.runnables.filter ? `/${this.runnables.filter}` : 'без фильтра';
+        this.right.setLabel(` ${project.name} • ${project.dir} • ${filter} • ${rows.length} `);
+        const body =
+            rows.length === 0
+                ? '{grey-fg}Ничего не найдено.{/}'
+                : rows
+                      .map((row, position) =>
+                          position === cursor && this.focus === 'right'
+                              ? `{inverse}${stripTags(row.label)}{/}`
+                              : row.label
+                      )
+                      .join('\n');
+        this.right.setContent(body);
+        if (this.focus === 'right') {
+            this.right.scrollTo(cursor);
+        }
+    }
+
+    handleRunnablesKey(chunk, key) {
+        const name = key?.name;
+        if (name === 'up' || name === 'down') {
+            this.moveRunnableCursor(name === 'down' ? 1 : -1);
+            this.render();
+            return true;
+        }
+        if (CONFIRM_KEYS.has(name)) {
+            const row = this.selectedRunnable();
+            if (row) {
+                this.openRunnable(row);
+            }
+            return true;
+        }
+        if (name === 'backspace') {
+            if (this.runnables.filter.length === 0) {
+                return false;
+            }
+            this.runnables.filter = this.runnables.filter.slice(0, -1);
+            this.render();
+            return true;
+        }
+        if (
+            !key?.ctrl &&
+            !key?.meta &&
+            typeof chunk === 'string' &&
+            chunk.length === 1 &&
+            chunk >= ' '
+        ) {
+            this.runnables.filter += chunk;
+            this.render();
+            return true;
+        }
+        return false;
+    }
+
+    /** Контейнеры — свой контекст; остальное запускается через меню и подтверждение. */
+    openRunnable(row) {
+        if (row.kind === 'containers') {
+            this.runnablesContext = 'containers';
+            this.render();
+            this.app.render();
+            return;
+        }
+        this.app.push(
+            new MenuView(this.app, {
+                title: row.label.trim(),
+                hint: '↑↓ выбор  Enter выполнить  Backspace назад',
+                items: [
+                    { label: 'Запустить (задачей, с логом)', value: 'run' },
+                    { label: 'Запустить в терминале', value: 'run-foreground' },
+                ],
+                onPick: (action) => {
+                    this.app.pop();
+                    this.app.runRunnable({
+                        project: this.selectedProject(),
+                        row,
+                        foreground: action === 'run-foreground',
+                    });
+                },
+            })
+        );
+    }
+
     /**
      * Первая строка — псевдосервис для операций над всем проектом. Выбор хранится
      * именем сервиса: список меняется от фильтра и от обновления ps.
      */
     visibleContainers() {
-        const store = this.app.compose;
+        const store = this.activeComposeStore();
         if (!store?.isEnabled()) {
             return [];
         }
@@ -2401,7 +2610,7 @@ class HomeView extends View {
     }
 
     renderContainers() {
-        const store = this.app.compose;
+        const store = this.activeComposeStore();
         const { up, total } = store.counters();
         const filter = this.containers.filter ? `/${this.containers.filter}` : 'без фильтра';
         this.right.setLabel(` ${store.project.name} • ${up}/${total} up • ${filter} `);
@@ -2424,7 +2633,7 @@ class HomeView extends View {
 
     containerLine(container) {
         const icon = container.state === 'running' ? '{green-fg}●{/}' : '{red-fg}✗{/}';
-        const pinned = this.app.compose.isPinned(container.service)
+        const pinned = this.activeComposeStore().isPinned(container.service)
             ? '  {yellow-fg}⇤ локально переопределён{/}'
             : '';
         return `${icon} ${container.service}  {grey-fg}${container.status}{/}${pinned}`;
@@ -2568,6 +2777,8 @@ class HomeView extends View {
         const context = this.rightContext();
         if (context === 'services') {
             this.renderServices();
+        } else if (context === 'runnables') {
+            this.renderRunnables();
         } else if (context === 'containers') {
             this.renderContainers();
         } else if (context === 'jobs') {
@@ -2762,6 +2973,19 @@ class HomeView extends View {
                 return true;
             }
         }
+        if (this.focus === 'right' && this.rightContext() === 'runnables') {
+            if (this.handleRunnablesKey(chunk, key)) {
+                return true;
+            }
+        }
+        if (
+            this.runnablesContext === 'containers' &&
+            (key?.name === 'escape' || key?.name === 'left')
+        ) {
+            this.runnablesContext = 'runnables';
+            this.render();
+            return true;
+        }
         if (this.focus === 'right' && this.rightContext() === 'containers') {
             if (this.handleContainersKey(chunk, key)) {
                 return true;
@@ -2929,7 +3153,8 @@ class HomeView extends View {
         }
         if (name === 'r') {
             this.app.index.refresh();
-            void this.app.compose?.refresh();
+            this.app.projects?.refresh();
+            void this.activeComposeStore()?.refresh();
             this.model.rebuild();
             this.syncServices();
             const pipeline = this.selectedPipeline();
@@ -3053,6 +3278,9 @@ class HomeView extends View {
         const context = this.rightContext();
         if (this.focus === 'right' && context === 'services') {
             return 'печатай фильтр  ↑↓ сервис  Пробел режим  Enter запуск  Tab/←/Esc назад  Ctrl+C выход';
+        }
+        if (this.focus === 'right' && context === 'runnables') {
+            return 'печатай фильтр  ↑↓ выбор  Enter действия  Tab/←/Esc назад  Ctrl+C выход';
         }
         if (this.focus === 'right' && context === 'containers') {
             return 'печатай фильтр  ↑↓ контейнер  Enter действия  Tab/←/Esc назад  Ctrl+C выход';
@@ -3256,6 +3484,11 @@ class HelpView extends View {
                 '  Enter на контейнере — меню: логи, обновить, образы и откат, рестарт, стоп',
                 '  первая строка списка — операции над всем проектом',
                 '  буквы фильтруют список, всё меняющее состояние спрашивает подтверждение',
+                '',
+                'Каталог проектов:',
+                '  курсор на проекте — справа его make-цели, скрипты, npm и контейнеры',
+                '  Enter — меню: запустить задачей или в терминале (для интерактивных)',
+                '  r — пересканировать проекты и перечитать состояние контейнеров',
 
             ].join('\n')
         );
@@ -3317,6 +3550,8 @@ class TuiApp {
         clipboardImpl = null,
         compose = null,
         imageCatalogImpl = null,
+        projects = null,
+        composeRegistry = null,
     }) {
         this.clipboard = clipboardImpl ?? ((text) => copyToClipboard(text));
         this.notice = null;
@@ -3328,6 +3563,11 @@ class TuiApp {
         this.manager = new TaskManager({ repoRoot });
         this.pipelines = pipelines ?? createPipelineStore({ repoRoot });
         this.compose = compose ?? createComposeStore({ startDir: repoRoot });
+        this.projects = projects ?? new ProjectIndex({ root: repoRoot });
+        if (!projects) {
+            this.projects.refresh();
+        }
+        this.composeRegistry = composeRegistry ?? new ComposeRegistry({ spawnSyncImpl: spawnSync });
         // Каталог нужен только при живом compose; реестр подставляется на вызов.
         this.imageCatalog =
             imageCatalogImpl ??
@@ -3398,11 +3638,18 @@ class TuiApp {
         if (this.ticks % every(30_000) === 0 && this.pipelines.hasRunning()) {
             void this.pipelines.refresh();
         }
-        // Контейнеры — раз в 5 с и только пока курсор стоит на секции compose.
-        if (this.ticks % every(5000) === 0 && this.compose.isEnabled()) {
+        // Контейнеры — раз в 5 с и только для того, на чём стоит курсор: 35
+        // проектов не должны превратиться в 35 опросов docker.
+        if (this.ticks % every(5000) === 0) {
             const view = this.stack.top();
-            if (view instanceof HomeView && view.model.selected()?.kind === 'compose') {
-                void this.compose.refresh();
+            if (view instanceof HomeView) {
+                const kind = view.model.selected()?.kind;
+                if (kind === 'compose' || kind === 'project') {
+                    const store = view.activeComposeStore();
+                    if (store?.isEnabled()) {
+                        void store.refresh();
+                    }
+                }
             }
         }
     }
@@ -3502,6 +3749,45 @@ class TuiApp {
         }
     }
 
+    readTextFile(file) {
+        try {
+            return fs.readFileSync(file, 'utf8');
+        } catch {
+            return null;
+        }
+    }
+
+    /** Контейнеры того, на чём стоит курсор: проекта или одиночного compose. */
+    activeCompose() {
+        const view = this.stack?.views.find((candidate) => candidate instanceof HomeView);
+        return view?.activeComposeStore() ?? this.compose;
+    }
+
+    /** Запуск цели make, скрипта или npm-скрипта проекта — всегда с подтверждением. */
+    runRunnable({ project, row, foreground }) {
+        const spec = specForRunnable({ project, row });
+        if (!spec) {
+            return;
+        }
+        const target = spec.spawnTarget();
+        this.confirmCommands({
+            title: `${foreground ? 'Запустить в терминале' : 'Запустить'} ${row.label.trim()}`,
+            targets: [target],
+            note: `рабочая папка: ${target.cwd ?? project.dir}`,
+            onConfirm: () => {
+                if (foreground) {
+                    this.suspend(() => {
+                        const status = this.manager.runTargetForeground(target);
+                        process.stdout.write(`\nЗавершилось с кодом ${status}.\n`);
+                        return status;
+                    });
+                    return;
+                }
+                this.manager.startCommand(spec);
+            },
+        });
+    }
+
     /** Общий диалог: показываем ровно те команды, которые уйдут в docker. */
     confirmCommands({ title, targets, note = '', onConfirm }) {
         const commands = targets
@@ -3520,7 +3806,7 @@ class TuiApp {
     }
 
     composeAction({ action, service }) {
-        const store = this.compose;
+        const store = this.activeCompose();
         if (!store?.isEnabled()) {
             return;
         }
@@ -3595,7 +3881,7 @@ class TuiApp {
     }
 
     async openImageCatalog(service) {
-        const store = this.compose;
+        const store = this.activeCompose();
         const container = store.containers().find((item) => item.service === service);
         const reference = imageReferenceForService(container);
         if (!reference) {
@@ -3646,7 +3932,7 @@ class TuiApp {
     }
 
     confirmRollback({ service, reference, item }) {
-        const store = this.compose;
+        const store = this.activeCompose();
         const targets = rollbackTargets({
             cli: store.cli,
             repo: reference.repo,
@@ -3756,6 +4042,7 @@ module.exports = {
     MakeCommand,
     ShellCommand,
     projectRunnables,
+    specForRunnable,
     DockerCommand,
     CommandSequence,
     RegistryLookup,

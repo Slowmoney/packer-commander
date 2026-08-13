@@ -862,6 +862,280 @@ test('состояние контейнеров опрашивается по т
     }
 });
 
+// --- Каталог проектов ---------------------------------------------------------
+
+const { ProjectIndex: Index, ComposeRegistry: Registry } = require('../src/task-runner.js');
+
+function optTree() {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-opt-'));
+    fs.mkdirSync(path.join(root, 'crm-boss'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'up-all.sh'), 'echo all');
+    fs.writeFileSync(path.join(root, 'crm-boss', 'docker-compose.yml'), 'name: crm-boss\n');
+    fs.writeFileSync(
+        path.join(root, 'crm-boss', 'makefile'),
+        'up:\n\techo up\ndown:\n\techo down\n'
+    );
+    fs.writeFileSync(path.join(root, 'crm-boss', 'check.sh'), 'echo check');
+    fs.writeFileSync(path.join(root, 'crm-boss', 'checkmig.sh'), 'echo mig');
+    return root;
+}
+
+async function optHome(extra = {}) {
+    const root = optTree();
+    const projects = new Index({ root });
+    projects.refresh();
+    const harness = bootstrap({
+        projects,
+        composeRegistry:
+            extra.composeRegistry ??
+            new Registry({ spawnSyncImpl: () => ({ status: 0, stdout: '', stderr: '' }) }),
+        ...extra,
+    });
+    harness.home.model.rebuild();
+    harness.home.model.selectKey(`project:${path.join(root, 'crm-boss')}`);
+    harness.home.render();
+    return { ...harness, root, projects };
+}
+
+test('секция проектов слева, запускаемое справа, по типам', async () => {
+    const { home, cleanup } = await optHome();
+    try {
+        assert.match(home.side.content, /Проекты \(1\)/);
+        assert.match(home.side.content, /crm-boss/);
+        assert.equal(home.rightContext(), 'runnables');
+        assert.deepEqual(
+            home.visibleRunnables().map((row) => row.kind),
+            ['containers', 'make', 'make', 'sh', 'sh']
+        );
+        assert.match(home.right.content, /контейнеры/);
+        assert.match(home.right.content, /make up/);
+        assert.match(home.right.content, /check\.sh/);
+    } finally {
+        cleanup();
+    }
+});
+
+test('фильтр находит скрипт по трём буквам и ничего не запускает', async () => {
+    const { app, home, press, type, cleanup } = await optHome();
+    try {
+        press(null, 'right');
+        type('che');
+
+        assert.deepEqual(
+            home.visibleRunnables().map((row) => path.basename(row.script ?? '')),
+            ['check.sh', 'checkmig.sh']
+        );
+        assert.equal(app.manager.tasks().length, 0);
+        assert.equal(app.stack.depth, 1);
+    } finally {
+        cleanup();
+    }
+});
+
+test('состояние проекта помнится: фильтр и выбранная строка', async () => {
+    const { home, press, type, cleanup } = await optHome();
+    try {
+        press(null, 'right');
+        type('make');
+        press(null, 'down');
+        const chosen = home.selectedRunnable().key;
+        const projectKey = home.model.rows().find((row) => row.kind === 'project' && !row.project.isRoot)
+            .key;
+
+        home.model.selectKey('command:build');
+        home.render();
+        home.model.selectKey(projectKey);
+        home.render();
+
+        assert.equal(home.runnables.filter, 'make');
+        assert.equal(home.selectedRunnable().key, chosen);
+    } finally {
+        cleanup();
+    }
+});
+
+test('при секции проектов отдельной секции Compose нет', async () => {
+    const { home, cleanup } = await optHome();
+    try {
+        assert.equal(home.side.content.includes('Compose'), false);
+    } finally {
+        cleanup();
+    }
+});
+
+test('Enter на скрипте открывает меню из двух пунктов', async () => {
+    const { app, home, press, pressEnter, cleanup } = await optHome();
+    try {
+        press(null, 'right');
+        home.runnables.selectedKey = `sh:${path.join(home.selectedProject().dir, 'check.sh')}`;
+        home.render();
+
+        pressEnter();
+
+        assert.equal(app.stack.depth, 2);
+        assert.match(app.stack.top().title, /check\.sh/);
+        assert.deepEqual(
+            app.stack.top().items.map((item) => item.value),
+            ['run', 'run-foreground']
+        );
+        assert.equal(app.manager.tasks().length, 0);
+    } finally {
+        cleanup();
+    }
+});
+
+test('запуск скрипта задачей: подтверждение с командой и папкой', async () => {
+    const { app, home, press, pressEnter, cleanup } = await optHome();
+    try {
+        press(null, 'right');
+        home.runnables.selectedKey = `sh:${path.join(home.selectedProject().dir, 'check.sh')}`;
+        home.render();
+        pressEnter();
+        pressEnter();
+
+        assert.ok(app.stack.top() instanceof ConfirmView);
+        assert.match(app.stack.top().text, /bash .*check\.sh/);
+        assert.match(app.stack.top().text, /рабочая папка/);
+        assert.equal(app.manager.tasks().length, 0);
+
+        press(null, 'y');
+        const task = app.manager.tasks()[0];
+        assert.match(task.spec.label(), /sh check\.sh \(crm-boss\)/);
+        assert.equal(task.spec.spawnTarget().cwd, home.selectedProject().dir);
+    } finally {
+        cleanup();
+    }
+});
+
+test('цель make запускается с -C рабочей папки', async () => {
+    const { app, home, press, pressEnter, cleanup } = await optHome();
+    try {
+        press(null, 'right');
+        home.runnables.selectedKey = 'make:up';
+        home.render();
+        pressEnter();
+        pressEnter();
+        press(null, 'y');
+
+        const task = app.manager.tasks()[0];
+        assert.deepEqual(task.spec.spawnTarget().args, ['-C', home.selectedProject().dir, 'up']);
+    } finally {
+        cleanup();
+    }
+});
+
+test('запуск в терминале сворачивает screen и ничего не добавляет в задачи', async () => {
+    const { app, home, screen, press, pressEnter, cleanup } = await optHome();
+    try {
+        press(null, 'right');
+        home.runnables.selectedKey = `sh:${path.join(home.selectedProject().dir, 'check.sh')}`;
+        home.render();
+        pressEnter();
+        press(null, 'down');
+        pressEnter();
+        press(null, 'y');
+
+        assert.ok(screen.left && screen.entered, 'screen снят и восстановлен');
+        assert.equal(app.manager.tasks().length, 0, 'foreground не создаёт задачу');
+    } finally {
+        cleanup();
+    }
+});
+
+test('строка контейнеров уводит в список контейнеров проекта и Esc возвращает', async () => {
+    const { app, home, press, pressEnter, cleanup } = await optHome();
+    try {
+        press(null, 'right');
+        home.runnables.selectedKey = 'containers';
+        home.render();
+
+        pressEnter();
+        assert.equal(home.rightContext(), 'containers');
+        assert.match(home.right.label, /crm-boss/);
+
+        press(null, 'escape');
+        assert.equal(home.rightContext(), 'runnables');
+        assert.match(home.right.content, /make up/);
+        assert.equal(app.stack.depth, 1, 'без модалок');
+    } finally {
+        cleanup();
+    }
+});
+
+test('действия с контейнером идут в docker выбранного проекта', async () => {
+    const { app, home, press, pressEnter, cleanup } = await optHome({
+        composeRegistry: new Registry({
+            spawnSyncImpl: () => ({
+                status: 0,
+                stdout: '{"Service":"api","Name":"api-1","State":"running","Status":"Up","Image":"repo/app:api"}',
+                stderr: '',
+            }),
+        }),
+    });
+    try {
+        press(null, 'right');
+        home.runnables.selectedKey = 'containers';
+        home.render();
+        pressEnter();
+        await home.activeComposeStore().refresh();
+        home.render();
+        press(null, 'down');
+        pressEnter();
+        press(null, 'down');
+        pressEnter();
+
+        assert.ok(app.stack.top() instanceof ConfirmView);
+        assert.match(app.stack.top().text, /crm-boss[/\\]docker-compose\.yml/);
+        press(null, 'y');
+
+        const task = app.manager.tasks()[0];
+        assert.match(task.spec.label(), /обновить api/);
+    } finally {
+        cleanup();
+    }
+});
+
+test('опрашивается только тот проект, на котором курсор', async () => {
+    const { app, home, cleanup } = await optHome({ tickMs: 1000 });
+    try {
+        const store = home.activeComposeStore();
+        let refreshes = 0;
+        store.refresh = async () => {
+            refreshes += 1;
+        };
+
+        for (let tick = 0; tick < 5; tick += 1) {
+            app.onTick();
+        }
+        assert.equal(refreshes, 1, 'один опрос за 5 секунд');
+
+        home.model.selectKey('command:build');
+        home.render();
+        for (let tick = 0; tick < 5; tick += 1) {
+            app.onTick();
+        }
+        assert.equal(refreshes, 1, 'ушли с проекта — опрос прекратился');
+    } finally {
+        cleanup();
+    }
+});
+
+test('r пересканирует проекты', async () => {
+    const { home, root, press, cleanup } = await optHome();
+    try {
+        fs.writeFileSync(path.join(root, 'crm-boss', 'newone.sh'), 'echo new');
+
+        press('r', 'r');
+
+        assert.ok(
+            home.allRunnables().some((row) => row.label.includes('newone.sh')),
+            'новый скрипт появился без перезапуска'
+        );
+    } finally {
+        cleanup();
+    }
+});
+
 test('r перечитывает состояние контейнеров немедленно', async () => {
     const { compose, press, cleanup } = await composeHome();
     try {
