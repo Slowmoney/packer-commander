@@ -1,6 +1,6 @@
 {
     "name": "packer-commander",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "description": "TUI-раннер npm-скриптов монорепозитория: живые статусы задач, логи, поиск и пайплайны GitLab",
     "keywords": [
         "tui",
